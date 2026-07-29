@@ -1,0 +1,23 @@
+## Archivos generados
+bin/
+obj/
+out/
+publish/
+*.user
+*.suo
+
+## IDEs / editores
+.vs/
+.vscode/
+.idea/
+.claude/
+
+## Secretos locales — nunca versionar
+appsettings.Local.json
+appsettings.*.Local.json
+*.pfx
+*.pem
+
+## Logs
+logs/
+*.log

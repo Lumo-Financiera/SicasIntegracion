@@ -1,0 +1,6 @@
+@LumoSys.Integraciones.API_HostAddress = http://localhost:5096
+
+GET {{LumoSys.Integraciones.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
