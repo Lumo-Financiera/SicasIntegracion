@@ -32,17 +32,17 @@ public sealed class PolizaDetalleSICASS
     public string? Inciso { get; init; }
 }
 
+/// <summary>Fila real de H03314011 (Table_Bitacora). No trae NumReporte (folio) ni Estatus —
+/// solo IDSiniestro (id interno de SICAS, se vincula contra SIN_FOLIO_SICAS) y Comentario
+/// en texto libre. Confirmado por inspección directa de la respuesta real.</summary>
 public sealed class SiniestroBitacoraSICAS
 {
+    public int? IDSiniestro { get; init; }
     public string? ClaveBit { get; init; }
-    public string? Estatus { get; init; }
-    public string? Comentarios { get; init; }
-    public string? FechaRegistro { get; init; }
-    public string? FechaEvento { get; init; }
+    public string? Comentario { get; init; }
+    public string? FechaHora { get; init; }
     public int? IsAutom { get; init; }
-    public string? Ejecutivo { get; init; }
     public int? IdUser { get; init; }
-    public string? NumReporte { get; init; }
 }
 
 public sealed class DatosSiniestro
@@ -55,6 +55,9 @@ public sealed class DatosSiniestro
     public string? Descripcion { get; init; }
     public string? NoSiniestro { get; init; }
     public string? NoReporte { get; init; }
+    /// <summary>IDSiniestro de SICAS (HDS00009) — se guarda en SIN_FOLIO_SICAS. Es el único campo
+    /// que la bitácora (H03314011) trae para vincular cada comentario a su siniestro.</summary>
+    public int? IDSiniestro { get; init; }
     /// <summary>Siempre "SISTEMA" — literal fijo del ETL legacy, no viene de SICAS.</summary>
     public string TipoOrigen { get; init; } = "SISTEMA";
     public DateTime? FechaResolucion { get; init; }

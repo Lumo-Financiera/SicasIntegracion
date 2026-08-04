@@ -10,6 +10,7 @@ public sealed class GuardarSiniestroCommand
     public string? Descripcion { get; init; }
     public string? NoSiniestro { get; init; }
     public string? NoReporte { get; init; }
+    public int? IDSiniestro { get; init; }
     public string? FechaResolucion { get; init; }
     public decimal? MontoIndemnizable { get; init; }
     public decimal? MontoDeducible { get; init; }

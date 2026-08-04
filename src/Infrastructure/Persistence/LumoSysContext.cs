@@ -205,6 +205,9 @@ public sealed class LumoSysContext(DbContextOptions<LumoSysContext> options) : D
         {
             e.ToTable("SINIESTROS", tb => tb.UseSqlOutputClause(false));
             e.HasKey(x => x.SIN_ID);
+            // SIN_ID no es IDENTITY en BD (confirmado vía sys.identity_columns) — se calcula
+            // manualmente en SiniestroRepository.ObtenerSiguienteSinIdAsync antes del insert.
+            e.Property(x => x.SIN_ID).ValueGeneratedNever();
 
             e.Property(x => x.SIN_MONTO_INDEMNIZABLE).HasPrecision(9, 2);
             e.Property(x => x.SIN_MONTO_DEDUCIBLE).HasPrecision(9, 2);

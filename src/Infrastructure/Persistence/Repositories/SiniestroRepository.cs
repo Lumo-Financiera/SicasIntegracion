@@ -23,6 +23,18 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
     public async Task<bool> ExisteVehiculoAsync(string serie, CancellationToken ct = default) =>
         (await ResolverCdeIdAsync(serie, ct)).HasValue;
 
+    /// <summary>SIN_ID no es identity — se calcula manualmente. UPDLOCK+HOLDLOCK sobre la
+    /// tabla completa evita que dos inserts concurrentes (ej. esta instancia y el servicio
+    /// corriendo en el servidor) calculen el mismo siguiente ID.</summary>
+    private async Task<int> ObtenerSiguienteSinIdAsync(CancellationToken ct)
+    {
+        var resultado = await db.Database
+            .SqlQuery<int>($"SELECT ISNULL(MAX(SIN_ID), 0) + 1 AS Value FROM SINIESTROS WITH (UPDLOCK, HOLDLOCK)")
+            .ToListAsync(ct);
+
+        return resultado[0];
+    }
+
     private async Task<int?> ResolverCdeIdAsync(string serie, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(serie))
@@ -55,8 +67,16 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
 
         if (existente is null)
         {
+            // SIN_ID no es identity ni tiene default/secuencia en BD (confirmado: sin
+            // sys.identity_columns, sin default constraint, sin SEQUENCE dedicada — a
+            // diferencia de ARC_ID que sí usa SEQ_ARC_ID/SP_ACTUALIZAR_SECUENCIAS). Se calcula
+            // aquí con MAX+1 bajo UPDLOCK/HOLDLOCK dentro de la misma transacción para evitar
+            // colisiones con otros procesos que insertan en SINIESTROS.
+            int nuevoId = await ObtenerSiguienteSinIdAsync(ct);
+
             existente = new SiniestrosModel
             {
+                SIN_ID             = nuevoId,
                 SIN_CDE_ID         = cdeId,
                 SIN_NO_REPORTE     = datos.NoReporte,
                 SIN_USU_ID         = 3,
@@ -69,6 +89,10 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         existente.SIN_TSI_ID               = tsiId;
         existente.SIN_TOR_ID               = torId;
         existente.SIN_NO_SINIESTRO         = datos.NoSiniestro;
+        // Único campo que trae la bitácora H03314011 para vincular sus comentarios a este
+        // siniestro (NumReporte/folio no viene en esa respuesta) — se rellena también en updates
+        // para siniestros ya existentes que se crearon antes de este fix.
+        existente.SIN_FOLIO_SICAS          = datos.IDSiniestro;
         existente.SIN_FECHA_EVENTO         = datos.FechaEvento;
         existente.SIN_FECHA_RESOLUCION     = datos.FechaResolucion;
         existente.SIN_DESCRIPCION          = datos.Descripcion;
@@ -242,6 +266,13 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
     {
         var sin = await db.Siniestros
             .FirstOrDefaultAsync(x => x.SIN_NO_REPORTE == noReporte, ct);
+        return sin?.SIN_ID;
+    }
+
+    public async Task<int?> BuscarIdPorFolioSicas(int idSiniestroSicas, CancellationToken ct = default)
+    {
+        var sin = await db.Siniestros
+            .FirstOrDefaultAsync(x => x.SIN_FOLIO_SICAS == idSiniestroSicas, ct);
         return sin?.SIN_ID;
     }
 }

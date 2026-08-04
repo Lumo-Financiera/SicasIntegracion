@@ -32,6 +32,7 @@ public sealed class GuardarSiniestroHandler(
                 Descripcion       = cmd.Descripcion,
                 NoSiniestro       = cmd.NoSiniestro,
                 NoReporte         = cmd.NoReporte,
+                IDSiniestro       = cmd.IDSiniestro,
                 FechaResolucion   = ParseFecha(cmd.FechaResolucion),
                 MontoIndemnizable = cmd.MontoIndemnizable,
                 MontoDeducible    = cmd.MontoDeducible,

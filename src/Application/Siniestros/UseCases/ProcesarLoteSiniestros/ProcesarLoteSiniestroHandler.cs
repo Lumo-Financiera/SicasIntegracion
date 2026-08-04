@@ -198,29 +198,33 @@ public sealed class ProcesarLoteSiniestroHandler(
 
                 foreach (var item in comentarios.Where(b => b.IsAutom == 0))
                 {
-                    if (string.IsNullOrWhiteSpace(item.NumReporte)) continue;
+                    if (item.IDSiniestro is null) continue;
 
-                    int? siniestroId = await siniestroRepo.BuscarIdPorReporte(item.NumReporte, ct);
+                    // H03314011 no trae NumReporte (folio) — solo IDSiniestro, el id interno de
+                    // SICAS que se guarda en SIN_FOLIO_SICAS al crear el siniestro (Fase 1).
+                    int? siniestroId = await siniestroRepo.BuscarIdPorFolioSicas(item.IDSiniestro.Value, ct);
                     if (siniestroId is null) continue;
 
-                    if (string.IsNullOrWhiteSpace(item.Comentarios)) continue;
+                    if (string.IsNullOrWhiteSpace(item.Comentario)) continue;
 
-                    DateTime fechaRegistro = DateTime.TryParse(item.FechaRegistro, out var fr) ? fr : DateTime.Now;
+                    DateTime fechaRegistro = DateTime.TryParse(item.FechaHora, out var fr) ? fr : DateTime.Now;
 
                     bool existe = await siniestroRepo.ExisteEstatusAsync(
-                        siniestroId.Value, item.Comentarios, fechaRegistro, ct);
+                        siniestroId.Value, item.Comentario, fechaRegistro, ct);
 
                     if (!existe)
                     {
                         await siniestroRepo.UpsertEstatusAsync(new DatosEstatus
                         {
-                            Estatus       = ObtenerTipoEstatus(item.Estatus),
-                            Comentarios   = item.Comentarios,
-                            FechaEvento   = DateTime.TryParse(item.FechaEvento, out var fe) ? fe : null,
+                            // H03314011 no trae un estatus formal (los comentarios son texto libre
+                            // de reparación/entrega, no corresponden al catálogo TIPOS_ESTATUS
+                            // SOLICITUD/DOCUMENTOS FALTANTES/EN TRAMITE/etc.) — se fija "EN TRAMITE"
+                            // para todo comentario de bitácora mientras el siniestro sigue abierto.
+                            Estatus       = "EN TRAMITE",
+                            Comentarios   = item.Comentario,
+                            FechaEvento   = null,
                             FechaRegistro = fechaRegistro,
-                            IdUser        = item.IdUser ?? 3,
-                            NumReporte    = item.NumReporte,
-                            Ejecutivo     = item.Ejecutivo
+                            IdUser        = item.IdUser ?? 3
                         }, siniestroId.Value, ct);
                     }
                 }
@@ -259,6 +263,7 @@ public sealed class ProcesarLoteSiniestroHandler(
             Descripcion       = siniestro.Descripcion,
             NoSiniestro       = siniestro.NumSiniestro,
             NoReporte         = siniestro.NumReporte,
+            IDSiniestro       = siniestro.IDSiniestro,
             FechaResolucion   = siniestro.FStatus,
             MontoIndemnizable = esRobo ? 0 : null,
             MontoDeducible    = null,
@@ -282,22 +287,6 @@ public sealed class ProcesarLoteSiniestroHandler(
             "ROTURA DE CRISTALES" or "ROTIRA DE CRISTALES" => "CRISTALES",
             "ASISTENCIA" => "ASISTENCIA VIAL",
             _ => cobAfectada
-        };
-    }
-
-    /// <summary>Replica ObtenerTipoEstatus del ETL legacy: corrige acentos faltantes en el texto
-    /// de estatus que manda la bitácora de SICAS antes de resolver contra TIPOS_ESTATUS.</summary>
-    private static string? ObtenerTipoEstatus(string? estatus)
-    {
-        if (string.IsNullOrEmpty(estatus))
-            return estatus;
-
-        string texto = estatus.ToUpper();
-        return texto switch
-        {
-            "FECHA DE RESOLUCION" => "FECHA DE RESOLUCIÓN",
-            "CANCELACION" => "CANCELACIÓN",
-            _ => estatus
         };
     }
 }

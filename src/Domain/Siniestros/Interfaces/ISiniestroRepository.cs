@@ -15,4 +15,9 @@ public interface ISiniestroRepository
     Task<bool> ExisteDocumentoAsync(int siniestroId, string nombreBase, CancellationToken ct = default);
     Task RegistrarDocumentoAsync(int siniestroId, string nombreArchivo, CancellationToken ct = default);
     Task<int?> BuscarIdPorReporte(string noReporte, CancellationToken ct = default);
+
+    /// <summary>Busca por SIN_FOLIO_SICAS (IDSiniestro interno de SICAS) — es el único campo que
+    /// trae la bitácora H03314011 para vincular cada comentario a su siniestro (NumReporte/folio
+    /// no viene en esa respuesta).</summary>
+    Task<int?> BuscarIdPorFolioSicas(int idSiniestroSicas, CancellationToken ct = default);
 }

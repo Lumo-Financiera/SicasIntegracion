@@ -66,6 +66,8 @@ POST /api/Etl/Seguros/Procesar
 { "Desde": "2026-07-01", "Hasta": "2026-07-22" }
 ```
 
+⚠️ Para rangos históricos largos (varias semanas), dividir en sub-rangos semanales en vez de mandar todo de una sola llamada — un rango muy largo puede tardar más que el timeout del cliente HTTP que lo invoque, y si el cliente cierra la conexión el proceso se corta a medias en el servidor (ver `CLAUDE.md`, sección "Fase 2").
+
 ### Reprocesar póliza individual
 ```http
 POST /api/Etl/Seguros/Procesar
@@ -143,3 +145,4 @@ La app corre como servicio de Windows continuo (no bajo IIS — evita el idle-ti
 - `dbIntegraciones` decomisionado — el log de errores ahora escribe en `LOG_ERRORES` de `dbLumoSys` (misma tabla que usa el resto de LumoSys), más un log diario redundante en archivo de texto (`C:\LumoSys\Programas\Sicas\Log dd-MM-yyyy.txt`)
 - Modo de intervalo opcional para actualizar datos cada N minutos durante el día, en vez de esperar al barrido nocturno completo
 - Corre como servicio de Windows con reinicio automático ante fallas
+- Bug crítico corregido en Fase 2 de Siniestros (bitácora de comentarios): nunca guardaba ningún comentario porque el campo usado para vincularlo con su siniestro (`NumReporte`) no existe en la respuesta real de SICAS — se corrigió vinculando por `IDSiniestro`/`SIN_FOLIO_SICAS` (ver `CLAUDE.md`)
