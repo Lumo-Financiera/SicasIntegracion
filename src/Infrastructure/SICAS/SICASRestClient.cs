@@ -63,27 +63,49 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             string url = $"{_baseUrl}/Security/GetToken" +
                 $"?sUserName={Uri.EscapeDataString(_usuario)}&sPassword={Uri.EscapeDataString(_contrasena)}";
 
-            using var resp = await _authHttp.PostAsync(url, new StringContent(string.Empty), ct);
-            if (!resp.IsSuccessStatusCode)
+            HttpResponseMessage resp;
+            try
             {
-                _log.LogError("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                resp = await _authHttp.PostAsync(url, new StringContent(string.Empty), ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Sin este catch la excepción de red subía cruda hasta el middleware, y el log
+                // mostraba un stack trace de sockets en vez de decir que SICAS no responde.
+                _log.LogError(ex, "No se pudo contactar a SICAS en {Url} para obtener el token. " +
+                                  "Ningun dato se va a sincronizar hasta que responda.", _baseUrl);
                 return null;
             }
 
-            string contenido = await resp.Content.ReadAsStringAsync(ct);
-            var json = JObject.Parse(contenido);
-
-            if (json["Sucess"]?.ToObject<bool>() != true)
+            using (resp)
             {
-                _log.LogError("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
-                return null;
+                if (!resp.IsSuccessStatusCode)
+                {
+                    _log.LogError("No se pudo obtener token SICAS: HTTP {Status} ({Codigo}).",
+                        resp.StatusCode, (int)resp.StatusCode);
+                    return null;
+                }
+
+                string contenido = await resp.Content.ReadAsStringAsync(ct);
+                var json = JObject.Parse(contenido);
+
+                if (json["Sucess"]?.ToObject<bool>() != true)
+                {
+                    _log.LogError("SICAS rechazó la autenticación del usuario configurado: {Mensaje}",
+                        json["Message"]?.ToString());
+                    return null;
+                }
+
+                bool esRenovacion = _token is not null;
+                _token      = json["Token"]?.ToString();
+                _tokenExpira = DateTime.Now.AddSeconds(150); // 2.5 min (TTL 3 min)
+
+                // Information y no Debug: es el latido que confirma que la conexión con SICAS vive.
+                // Si el log deja de mostrar esto durante un lote, el ETL está atorado antes de SICAS.
+                _log.LogInformation("Token SICAS {Accion}, expira {Expira:HH:mm:ss}",
+                    esRenovacion ? "renovado" : "obtenido", _tokenExpira);
+                return _token;
             }
-
-            _token      = json["Token"]?.ToString();
-            _tokenExpira = DateTime.Now.AddSeconds(150); // 2.5 min (TTL 3 min)
-
-            _log.LogDebug("Token SICAS obtenido, expira: {Expira:HH:mm:ss}", _tokenExpira);
-            return _token;
         }
         finally
         {
@@ -102,8 +124,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     /// </summary>
     public async Task<List<T>?> ReadData<T>(SolicitudReadData solicitud, CancellationToken ct = default) where T : class
     {
+        var cronometro = System.Diagnostics.Stopwatch.StartNew();
+
         string? token = await EnsureToken(ct);
-        if (token is null) return null;
+        if (token is null)
+        {
+            _log.LogError("ReadData {KeyCode}: sin token, no se pudo consultar SICAS.", solicitud.KeyCode);
+            return null;
+        }
 
         var req = new RestRequest("Report/ReadData", Method.Post);
         req.AddHeader("Authorization", token);
@@ -119,7 +147,11 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         var resp = await EjecutarConReintentos(req, ct);
         if (!resp.IsSuccessStatusCode || resp.Content is null)
         {
-            _log.LogWarning("ReadData {KeyCode} falló: {Status}", solicitud.KeyCode, resp.StatusCode);
+            // Error, no Warning: un ReadData fallido significa que ese pedazo de datos no se
+            // procesó. Antes esto se confundía con "no hay registros" al leer el log.
+            _log.LogError("ReadData {KeyCode} pagina {Pagina} FALLO: {Status} tras {Ms} ms. " +
+                          "Los registros de esta consulta NO se procesaron.",
+                solicitud.KeyCode, solicitud.Page, resp.StatusCode, cronometro.ElapsedMilliseconds);
             return null;
         }
 
@@ -130,7 +162,19 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         {
             try
             {
-                return ExtraerFilas<T>(contenido);
+                var filas = ExtraerFilas<T>(contenido);
+
+                // Distingue explícitamente "0 registros" de "falló la consulta": son dos cosas
+                // muy distintas al diagnosticar y antes se veían igual en el log.
+                _log.LogDebug("ReadData {KeyCode} pagina {Pagina}: {Count} registros en {Ms} ms",
+                    solicitud.KeyCode, solicitud.Page, filas?.Count ?? 0, cronometro.ElapsedMilliseconds);
+
+                // Una consulta lenta explica por sí sola un lote que no termina.
+                if (cronometro.ElapsedMilliseconds > 15_000)
+                    _log.LogWarning("ReadData {KeyCode} pagina {Pagina} tardo {Ms} ms ({Count} registros).",
+                        solicitud.KeyCode, solicitud.Page, cronometro.ElapsedMilliseconds, filas?.Count ?? 0);
+
+                return filas;
             }
             catch (JsonReaderException ex)
             {
@@ -142,12 +186,17 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
                 }
                 else
                 {
-                    _log.LogWarning(ex, "JSON inválido en ReadData {KeyCode}", solicitud.KeyCode);
+                    _log.LogError(ex, "JSON invalido e irreparable en ReadData {KeyCode} pagina {Pagina}; " +
+                                      "los registros de esta consulta NO se procesaron.",
+                        solicitud.KeyCode, solicitud.Page);
                     return null;
                 }
             }
         }
 
+        _log.LogError("ReadData {KeyCode} pagina {Pagina}: JSON no se pudo reparar tras {Max} intentos; " +
+                      "los registros de esta consulta NO se procesaron.",
+            solicitud.KeyCode, solicitud.Page, maxReintentos);
         return null;
     }
 
@@ -165,10 +214,21 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         {
             resp = await _http.ExecuteAsync(req, ct);
             if (resp.IsSuccessStatusCode || resp.StatusCode != 0 || intento >= maxIntentos)
+            {
+                if (intento > 1 && resp.IsSuccessStatusCode)
+                    _log.LogInformation("SICAS respondio tras {Intentos} intentos ({Recurso}).",
+                        intento, req.Resource);
+                else if (!resp.IsSuccessStatusCode && intento >= maxIntentos)
+                    _log.LogError("SICAS no respondio tras {Max} intentos ({Recurso}); se abandona la llamada.",
+                        maxIntentos, req.Resource);
                 return resp;
+            }
 
-            _log.LogDebug("Fallo de conexión con SICAS (intento {Intento}/{Max}), reintentando en {Segundos}s",
-                intento, maxIntentos, intento * 2);
+            // Warning y no Debug: una caída de conexión con SICAS es señal operativa real,
+            // y con el nivel Debug apagado en producción no quedaba constancia de ninguna.
+            _log.LogWarning("Fallo de conexion con SICAS en {Recurso} (intento {Intento}/{Max}), " +
+                            "reintentando en {Segundos}s",
+                req.Resource, intento, maxIntentos, intento * 2);
             await Task.Delay(TimeSpan.FromSeconds(intento * 2), ct);
             intento++;
         }
@@ -233,11 +293,24 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             }
 
             var datos = resultado["ListData"]?.ToObject<List<ArchivoSICAS>>();
-            return datos?.Where(a => !string.IsNullOrEmpty(a.PathWWW)).ToList() ?? [];
+            var conRuta = datos?.Where(a => !string.IsNullOrEmpty(a.PathWWW)).ToList() ?? [];
+
+            // Deja constancia de los que SICAS listó pero vienen sin PathWWW: no se pueden bajar
+            // y antes desaparecían del conteo sin explicación.
+            int descartados = (datos?.Count ?? 0) - conRuta.Count;
+            if (descartados > 0)
+                _log.LogWarning("GetFiles identity={Identity} valuePK={PK}: {Descartados} archivo(s) sin PathWWW; " +
+                                "no se pueden descargar.", identity, valuePK, descartados);
+
+            _log.LogDebug("GetFiles identity={Identity} valuePK={PK}: {Count} archivo(s) descargables.",
+                identity, valuePK, conRuta.Count);
+
+            return conRuta;
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Error parseando GetFiles");
+            _log.LogError(ex, "Error parseando GetFiles identity={Identity} valuePK={PK}; " +
+                              "los documentos de esta entidad NO se procesaron.", identity, valuePK);
             return [];
         }
     }

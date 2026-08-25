@@ -21,7 +21,8 @@ public sealed class SegurosEtlBackgroundService(
         while (!stoppingToken.IsCancellationRequested)
         {
             TimeSpan delay = TiempoHastaProximaEjecucion("EtlSchedule:Seguros", "00:05");
-            log.LogInformation("ETL Seguros: próxima ejecución en {Delay}", delay);
+            log.LogInformation("ETL Seguros (diario): proxima ejecucion {Cuando:dd/MM/yyyy HH:mm} (en {Delay:hh\\:mm\\:ss})",
+                DateTime.Now.Add(delay), delay);
 
             await Task.Delay(delay, stoppingToken);
 

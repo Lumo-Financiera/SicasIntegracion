@@ -1,3 +1,4 @@
+using System.Reflection;
 using LumoSys.Integraciones.API.BackgroundServices;
 using LumoSys.Integraciones.API.Middlewares;
 using LumoSys.Integraciones.Application.Seguros.UseCases.GuardarPoliza;
@@ -7,6 +8,7 @@ using LumoSys.Integraciones.Application.Seguros.UseCases.SubirDocumentoPoliza;
 using LumoSys.Integraciones.Application.Siniestros.UseCases.GuardarSiniestro;
 using LumoSys.Integraciones.Application.Siniestros.UseCases.ProcesarLoteSiniestros;
 using LumoSys.Integraciones.Infrastructure.Extensions;
+using LumoSys.Integraciones.Infrastructure.Notifications;
 using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -19,6 +21,15 @@ builder.Host.UseWindowsService(opts => opts.ServiceName = "LumoSysIntegraciones"
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 
 var cfg = builder.Configuration;
+
+// ── Log de archivo ─────────────────────────────────────────────────────────
+// Va primero y aparte: corriendo como servicio de Windows no hay consola, y UseWindowsService()
+// solo manda al Event Log desde Warning. Sin este proveedor, todo el ILogger del ETL se pierde.
+builder.Services.AddLogArchivo(cfg);
+
+// Sin tracking de Activity: en un ETL, SpanId/TraceId/ParentId solo alargan cada línea del log.
+// La correlación útil la da el scope propio de cada lote (ver ResumenLote.CorrelacionId).
+builder.Logging.Configure(opts => opts.ActivityTrackingOptions = ActivityTrackingOptions.None);
 
 // ── Application handlers ───────────────────────────────────────────────────
 builder.Services.AddScoped<GuardarPolizaHandler>();
@@ -60,6 +71,8 @@ builder.Services.AddSwaggerGen(opt =>
 // ── Build ─────────────────────────────────────────────────────────────────
 var app = builder.Build();
 
+RegistrarArranque(app);
+
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
 if (app.Environment.IsDevelopment())
@@ -76,3 +89,53 @@ app.UseHttpsRedirection();
 app.MapControllers();
 
 app.Run();
+
+/// <summary>Deja constancia en el log de con qué configuración arrancó el servicio.
+/// Es lo primero que se necesita al diagnosticar: contra qué base y qué SICAS está apuntando,
+/// si el modo intervalo quedó activo, y a dónde van los documentos. Nunca imprime credenciales.</summary>
+static void RegistrarArranque(WebApplication app)
+{
+    var log = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Arranque");
+    var cfg = app.Configuration;
+
+    string version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "desconocida";
+    var compilado = File.GetLastWriteTime(Assembly.GetExecutingAssembly().Location);
+
+    log.LogInformation("===== LumoSysIntegraciones v{Version} arrancando (binario del {Compilado:dd/MM/yyyy HH:mm}) =====",
+        version, compilado);
+    log.LogInformation("Entorno={Entorno} · Urls={Urls} · MaquinaHost={Maquina}",
+        app.Environment.EnvironmentName, cfg["Urls"] ?? "(default)", Environment.MachineName);
+    log.LogInformation("BD destino: {Bd}", DescribirConexion(cfg.GetConnectionString("LumoSys")));
+    log.LogInformation("SICAS: {Url} · usuario configurado={Tiene}",
+        cfg["SICAS:BaseUrl"], !string.IsNullOrWhiteSpace(cfg["SICAS:Usuario"]));
+    log.LogInformation("SFleet: {Url} · credenciales configuradas={Tiene}",
+        cfg["SFleet:BaseUrl"], !string.IsNullOrWhiteSpace(cfg["SFleet:Email"]));
+    log.LogInformation("FTP: {Host} · polizas='{Polizas}' · siniestros='{Siniestros}'",
+        cfg["Ftp:Host"], cfg["Ftp:RutaDestinoPolizas"], cfg["Ftp:RutaDestinoSiniestros"]);
+
+    log.LogInformation("ETL diario: Seguros={HoraSeg} Siniestros={HoraSin}",
+        cfg["EtlSchedule:Seguros"] ?? "00:05", cfg["EtlSchedule:Siniestros"] ?? "00:10");
+    log.LogInformation("ETL intervalo: Seguros cada {IntSeg} min/ventana {VenSeg} · Siniestros cada {IntSin} min/ventana {VenSin} (0 = apagado)",
+        cfg["EtlSchedule:IntervaloMinutosSeguros"] ?? "0", cfg["EtlSchedule:VentanaMinutosSeguros"] ?? "0",
+        cfg["EtlSchedule:IntervaloMinutosSiniestros"] ?? "0", cfg["EtlSchedule:VentanaMinutosSiniestros"] ?? "0");
+
+    var logOpts = app.Services.GetRequiredService<IOptions<LogArchivoOptions>>().Value;
+    log.LogInformation("Log de archivo: carpeta='{Carpeta}' retencion={Dias}d supresion={Sup}min",
+        logOpts.Carpeta, logOpts.RetencionDias, logOpts.SupresionMinutos);
+}
+
+/// <summary>Extrae solo servidor y catálogo de la cadena de conexión — el resto lleva la contraseña.</summary>
+static string DescribirConexion(string? cadena)
+{
+    if (string.IsNullOrWhiteSpace(cadena)) return "(sin configurar)";
+
+    try
+    {
+        var b = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(cadena);
+        return $"{b.DataSource}/{b.InitialCatalog}";
+    }
+    catch
+    {
+        return "(cadena no parseable)";
+    }
+}

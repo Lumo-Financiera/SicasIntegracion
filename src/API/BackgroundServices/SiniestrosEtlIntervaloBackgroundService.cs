@@ -25,8 +25,10 @@ public sealed class SiniestrosEtlIntervaloBackgroundService(
 
         int ventanaMinutos = ObtenerMinutos("EtlSchedule:VentanaMinutosSiniestros") ?? (intervaloMinutos.Value + 10);
 
-        log.LogInformation("ETL Siniestros (intervalo): iniciado, cada {Minutos} min, ventana de {Ventana} min.",
-            intervaloMinutos, ventanaMinutos);
+        // Deja claro que la primera corrida NO es inmediata: espera un intervalo completo.
+        log.LogInformation("ETL Siniestros (intervalo): activo, cada {Minutos} min con ventana de {Ventana} min. " +
+                           "Primera corrida {Primera:HH:mm}.",
+            intervaloMinutos, ventanaMinutos, DateTime.Now.AddMinutes(intervaloMinutos.Value));
 
         while (!stoppingToken.IsCancellationRequested)
         {

@@ -4,10 +4,11 @@ using LumoSys.Integraciones.Domain.Seguros.Interfaces;
 using LumoSys.Integraciones.Domain.Seguros.Models;
 using LumoSys.Integraciones.Infrastructure.Persistence.Models;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 
 namespace LumoSys.Integraciones.Infrastructure.Persistence.Repositories;
 
-public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
+public sealed class PolizaRepository(LumoSysContext db, ILogger<PolizaRepository> log) : IPolizaRepository
 {
     private const int ESTATUS_VIGENTE = 177;
     private const int ESTATUS_SUSTITUCION = 497;
@@ -490,11 +491,25 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         // si no se puede vincular, se omite (limitación conocida del esquema, no un error).
         var compra = await db.ComprasDetalles.FirstOrDefaultAsync(x => x.CDE_NO_SERIE == serie, ct);
         if (compra is null)
+        {
+            // El archivo ya está en el FTP pero queda sin aparecer en la ficha de la unidad.
+            // Antes esto pasaba en silencio y el documento simplemente "no aparecía" sin motivo.
+            log.LogWarning("Documento ARC_ID={ArcId}: la serie {Serie} no tiene COMPRAS_DETALLES, " +
+                           "no se puede vincular en DOCUMENTOS_UNIDADES (DUN_CDE_ID es NOT NULL). " +
+                           "El archivo quedo subido al FTP pero no aparecera ligado a la unidad.",
+                archivoId, serie);
             return;
+        }
 
         var c = await db.Compras.FirstOrDefaultAsync(x => x.COM_ID == compra.CDE_COM_ID, ct);
         if (c?.COM_CLI_ID is not int cliId)
+        {
+            log.LogWarning("Documento ARC_ID={ArcId}: la compra COM_ID={ComId} de la serie {Serie} no tiene " +
+                           "COM_CLI_ID, no se puede vincular en DOCUMENTOS_UNIDADES (DUN_CLI_ID es NOT NULL). " +
+                           "El archivo quedo subido al FTP pero no aparecera ligado a la unidad.",
+                archivoId, compra.CDE_COM_ID, serie);
             return;
+        }
 
         var doc = new DocumentosUnidadesModel
         {
@@ -509,6 +524,9 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
 
         db.DocumentosUnidades.Add(doc);
         await db.SaveChangesAsync(ct);
+
+        log.LogInformation("Documento ARC_ID={ArcId} vinculado a la unidad (serie {Serie}, CDE_ID={CdeId}).",
+            archivoId, serie, compra.CDE_ID);
     }
 
     public Task<int> ObtenerSecuenciaAsync(string tabla, CancellationToken ct = default) =>

@@ -21,7 +21,8 @@ public sealed class SiniestrosEtlBackgroundService(
         while (!stoppingToken.IsCancellationRequested)
         {
             TimeSpan delay = TiempoHastaProximaEjecucion("EtlSchedule:Siniestros", "00:10");
-            log.LogInformation("ETL Siniestros: próxima ejecución en {Delay}", delay);
+            log.LogInformation("ETL Siniestros (diario): proxima ejecucion {Cuando:dd/MM/yyyy HH:mm} (en {Delay:hh\\:mm\\:ss})",
+                DateTime.Now.Add(delay), delay);
 
             await Task.Delay(delay, stoppingToken);
 
