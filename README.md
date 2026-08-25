@@ -1,5 +1,17 @@
 # LumoSys Integraciones — Seguros & Siniestros
 
+## Documentación
+
+| Documento | Para qué |
+|---|---|
+| [docs/PLAN_DE_ACCION.md](docs/PLAN_DE_ACCION.md) | **Empieza aquí.** Pendientes por fases para arreglar la sincronización de siniestros |
+| [docs/DIAGNOSTICO_FALLOS_TEAMS.md](docs/DIAGNOSTICO_FALLOS_TEAMS.md) | Análisis de los fallos reportados, con evidencia contra datos reales |
+| [docs/CONTEXTO_INTEGRACION_SICAS.md](docs/CONTEXTO_INTEGRACION_SICAS.md) | Cómo funciona el integrador por dentro, de punta a punta |
+| [docs/OBSERVABILIDAD_Y_LOGS.md](docs/OBSERVABILIDAD_Y_LOGS.md) | Cómo leer el log y recetas de diagnóstico |
+| [CLAUDE.md](CLAUDE.md) | Historial detallado de bugs, hallazgos y decisiones de diseño |
+
+---
+
 Proyecto unificado que fusiona tres proyectos anteriores:
 
 | Proyecto anterior | Tecnología | Rol |
