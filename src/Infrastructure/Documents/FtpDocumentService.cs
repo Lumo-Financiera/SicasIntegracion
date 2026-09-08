@@ -16,6 +16,7 @@ public sealed class FtpOptions
 
 public sealed class FtpDocumentService(
     IOptions<FtpOptions> opts,
+    IMonitoreoErrores monitoreo,
     ILogger<FtpDocumentService> log) : IDocumentService
 {
     private readonly FtpOptions _opts = opts.Value;
@@ -51,14 +52,29 @@ public sealed class FtpDocumentService(
             if (status == FtpStatus.Success || status == FtpStatus.Skipped)
             {
                 log.LogInformation("FTP: {Archivo} subido a {Ruta}", nombreArchivo, rutaDestino);
+                monitoreo.Rastrear("ftp.subida", $"{nombreArchivo} subido a {rutaDestino}",
+                    ("estado", status.ToString()), ("bytes", bytes.Length.ToString()));
                 return 1;
             }
 
             log.LogWarning("FTP: {Archivo} no se subió (estado {Status})", nombreArchivo, status);
+            monitoreo.RastrearFallo("ftp.subida", $"{nombreArchivo} no se subió",
+                ("estado", status.ToString()), ("ruta", rutaDestino));
             return 0;
         }
         catch (Exception ex)
         {
+            // Se conserva el retorno 0 (contrato de IDocumentService: el llamador decide si el
+            // documento se reintenta o se omite), pero el fallo se reporta con el destino real —
+            // sin el host y la ruta, un "530 User cannot log in" o un timeout de red no se
+            // distinguen de un archivo corrupto (ver CLAUDE.md, cuenta de servicio del FTP).
+            monitoreo.Capturar(ex, "ftp.subir-archivo",
+                ("ftp_host", _opts.Host),
+                ("ftp_ruta", rutaDestino),
+                ("archivo", nombreArchivo),
+                ("consecuencia", "documento-no-subido"));
+            monitoreo.AgregarDato("archivo_bytes", bytes.Length);
+
             log.LogError(ex, "Error FTP subiendo {Archivo}", nombreArchivo);
             return 0;
         }

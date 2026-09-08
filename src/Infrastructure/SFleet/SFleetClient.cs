@@ -16,6 +16,7 @@ public sealed class SFleetOptions
 
 public sealed class SFleetClient(
     IOptions<SFleetOptions> opts,
+    IMonitoreoErrores monitoreo,
     ILogger<SFleetClient> log) : ISFleetClient, IDisposable
 {
     private readonly RestClient _http = new(opts.Value.BaseUrl);
@@ -31,7 +32,16 @@ public sealed class SFleetClient(
         req.AddParameter("password", _opts.Password);
 
         var resp = await _http.ExecuteAsync(req, ct);
-        if (!resp.IsSuccessStatusCode || resp.Content is null) return null;
+        if (!resp.IsSuccessStatusCode || resp.Content is null)
+        {
+            // Antes se devolvía null sin dejar registro: con las credenciales caídas, cada póliza
+            // salía como "serie no encontrada en SFleet" (un aviso normal) y nada indicaba que en
+            // realidad ninguna se estaba sincronizando.
+            log.LogError("No se pudo autenticar contra SFleet: {Status}", resp.StatusCode);
+            monitoreo.RastrearFallo("sfleet.token", "Autenticación rechazada",
+                ("status", resp.StatusCode.ToString()), ("email", _opts.Email));
+            return null;
+        }
 
         var json = Newtonsoft.Json.Linq.JObject.Parse(resp.Content);
         _token = json["access_token"]?.ToString();
@@ -102,6 +112,10 @@ public sealed class SFleetClient(
         if (!resp.IsSuccessStatusCode || resp.Content is null)
         {
             log.LogWarning("SFleet GuardarPoliza {Poliza} falló: {Status}", solicitud.NumeroPoliza, resp.StatusCode);
+            monitoreo.RastrearFallo("sfleet.guardar-poliza", $"SFleet rechazó la póliza {solicitud.NumeroPoliza}",
+                ("status", resp.StatusCode.ToString()),
+                ("operacion", esEdicion ? "edicion" : "alta"),
+                ("vehiculo_id", vehiculoId.ToString()));
             return 0;
         }
 

@@ -28,17 +28,20 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     private readonly string _usuario;
     private readonly string _contrasena;
     private readonly ILogger<SICASRestClient> _log;
+    private readonly IMonitoreoErrores _monitoreo;
 
     private string? _token;
     private DateTime _tokenExpira = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public SICASRestClient(IOptions<SICASOptions> opts, ILogger<SICASRestClient> log)
+    public SICASRestClient(
+        IOptions<SICASOptions> opts, IMonitoreoErrores monitoreo, ILogger<SICASRestClient> log)
     {
         _baseUrl    = opts.Value.BaseUrl.TrimEnd('/');
         _usuario    = opts.Value.Usuario;
         _contrasena = opts.Value.Contrasena;
         _log        = log;
+        _monitoreo  = monitoreo;
         _http       = new RestClient(opts.Value.BaseUrl);
     }
 
@@ -67,6 +70,8 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (!resp.IsSuccessStatusCode)
             {
                 _log.LogError("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                _monitoreo.RastrearFallo("sicas.token", "GetToken no respondió correctamente",
+                    ("status", resp.StatusCode.ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -76,6 +81,8 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (json["Sucess"]?.ToObject<bool>() != true)
             {
                 _log.LogError("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
+                _monitoreo.RastrearFallo("sicas.token", "SICAS rechazó la autenticación",
+                    ("mensaje", json["Message"]?.ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -120,6 +127,10 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         if (!resp.IsSuccessStatusCode || resp.Content is null)
         {
             _log.LogWarning("ReadData {KeyCode} falló: {Status}", solicitud.KeyCode, resp.StatusCode);
+            _monitoreo.RastrearFallo("sicas.readdata", $"ReadData {solicitud.KeyCode} falló",
+                ("keycode", solicitud.KeyCode),
+                ("status", resp.StatusCode.ToString()),
+                ("pagina", solicitud.Page.ToString()));
             return null;
         }
 
@@ -143,6 +154,12 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
                 else
                 {
                     _log.LogWarning(ex, "JSON inválido en ReadData {KeyCode}", solicitud.KeyCode);
+                    // El JSON malformado de SICAS se repara hasta 5 veces; llegar aquí significa
+                    // que la reparación no alcanzó y ese registro se pierde en silencio.
+                    _monitoreo.Capturar(ex, "sicas.readdata",
+                        ("keycode", solicitud.KeyCode),
+                        ("pagina", solicitud.Page.ToString()),
+                        ("consecuencia", "respuesta-descartada-json-irreparable"));
                     return null;
                 }
             }
@@ -237,6 +254,11 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
         catch (Exception ex)
         {
+            _monitoreo.Capturar(ex, "sicas.getfiles",
+                ("identity", identity),
+                ("valuepk", valuePK.ToString()),
+                ("consecuencia", "documentos-no-listados"));
+
             _log.LogWarning(ex, "Error parseando GetFiles");
             return [];
         }
@@ -259,6 +281,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
         catch (Exception ex)
         {
+            // Se conserva el retorno null (el llamador lo trata como "documento no disponible" y
+            // sigue con el siguiente), pero se reporta: un documento que nunca llega es la falla
+            // más difícil de notar, porque la póliza/siniestro sí queda guardado.
+            _monitoreo.Capturar(ex, "sicas.descargar-archivo",
+                ("archivo_url", fileUrl),
+                ("consecuencia", "documento-no-descargado"));
+
             _log.LogError(ex, "Error descargando archivo {Url}", fileUrl);
             return null;
         }

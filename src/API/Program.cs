@@ -1,4 +1,5 @@
 using LumoSys.Integraciones.API.BackgroundServices;
+using LumoSys.Integraciones.API.Extensions;
 using LumoSys.Integraciones.API.Middlewares;
 using LumoSys.Integraciones.Application.Seguros.UseCases.GuardarPoliza;
 using LumoSys.Integraciones.Application.Seguros.UseCases.ProcesarLoteSeguros;
@@ -19,6 +20,12 @@ builder.Host.UseWindowsService(opts => opts.ServiceName = "LumoSysIntegraciones"
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 
 var cfg = builder.Configuration;
+
+// ── Monitoreo (Sentry) ───────────────────────────────────────────────────
+// Va antes que cualquier otro registro: así las fallas de arranque de los servicios de abajo
+// (cadena de conexión inválida, config faltante) también quedan reportadas.
+// Debe cargarse después de appsettings.Local.json para poder sobreescribir el DSN por ambiente.
+builder.ConfigurarSentry();
 
 // ── Application handlers ───────────────────────────────────────────────────
 builder.Services.AddScoped<GuardarPolizaHandler>();

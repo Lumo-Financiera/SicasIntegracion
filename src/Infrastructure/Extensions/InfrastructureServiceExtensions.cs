@@ -2,6 +2,7 @@ using LumoSys.Integraciones.Domain.Seguros.Interfaces;
 using LumoSys.Integraciones.Domain.Shared.Interfaces;
 using LumoSys.Integraciones.Domain.Siniestros.Interfaces;
 using LumoSys.Integraciones.Infrastructure.Documents;
+using LumoSys.Integraciones.Infrastructure.Monitoring;
 using LumoSys.Integraciones.Infrastructure.Notifications;
 using LumoSys.Integraciones.Infrastructure.Persistence;
 using LumoSys.Integraciones.Infrastructure.Persistence.Repositories;
@@ -44,6 +45,13 @@ public static class InfrastructureServiceExtensions
         // Servicios externos
         services.AddScoped<IDocumentService, FtpDocumentService>();
         services.AddScoped<ISFleetClient, SFleetClient>();
+
+        // Monitoreo (Sentry) — singletons: el SDK es estático y el aislamiento entre unidades
+        // de trabajo lo da el ámbito (PushScope), no la instancia. La inicialización del SDK
+        // ocurre en el arranque de la API (SentryStartupExtensions.ConfigurarSentry); si no hay
+        // DSN configurado, estas implementaciones quedan como no-op y el ETL corre igual.
+        services.AddSingleton<IMonitoreoErrores, SentryMonitoreoErrores>();
+        services.AddSingleton<IMonitoreoEtl, SentryMonitoreoEtl>();
 
         return services;
     }
