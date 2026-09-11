@@ -110,7 +110,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     public async Task<List<T>?> ReadData<T>(SolicitudReadData solicitud, CancellationToken ct = default) where T : class
     {
         string? token = await EnsureToken(ct);
-        if (token is null) return null;
+        if (token is null)
+        {
+            // Rastro y no evento a propósito: EnsureToken ya reportó la causa raíz con LogError.
+            // Emitir aquí otro evento por cada consulta multiplicaría un solo fallo en decenas.
+            _monitoreo.RastrearFallo("sicas.readdata", $"Sin token: no se consultó {solicitud.KeyCode}",
+                ("keycode", solicitud.KeyCode), ("pagina", solicitud.Page.ToString()));
+            return null;
+        }
 
         var req = new RestRequest("Report/ReadData", Method.Post);
         req.AddHeader("Authorization", token);
@@ -127,9 +134,16 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         if (!resp.IsSuccessStatusCode || resp.Content is null)
         {
             _log.LogWarning("ReadData {KeyCode} falló: {Status}", solicitud.KeyCode, resp.StatusCode);
-            _monitoreo.RastrearFallo("sicas.readdata", $"ReadData {solicitud.KeyCode} falló",
+
+            // Éste es el fallo silencioso más peligroso del integrador: los clientes de dominio
+            // convierten este null en lista vacía (`resp ?? []`), el barrido lo lee como "no hay
+            // registros", corta el recorrido de páginas y se declara exitoso. Sin este reporte,
+            // "SICAS está caído" y "hoy no hubo pólizas" son indistinguibles.
+            _monitoreo.ReportarFalloSilencioso("sicas.readdata",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al consultar {solicitud.KeyCode}",
+                "consulta-descartada-se-lee-como-sin-registros",
                 ("keycode", solicitud.KeyCode),
-                ("status", resp.StatusCode.ToString()),
+                ("status", ((int)resp.StatusCode).ToString()),
                 ("pagina", solicitud.Page.ToString()));
             return null;
         }
@@ -165,6 +179,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             }
         }
 
+        // Se agotaron los 5 intentos de reparación sin conseguir un JSON válido. Mismo efecto que
+        // arriba: el llamador lo verá como "sin registros".
+        _monitoreo.ReportarFalloSilencioso("sicas.readdata",
+            $"JSON de {solicitud.KeyCode} sigue siendo inválido tras {maxReintentos} reparaciones",
+            "consulta-descartada-se-lee-como-sin-registros",
+            ("keycode", solicitud.KeyCode),
+            ("pagina", solicitud.Page.ToString()));
         return null;
     }
 
@@ -212,7 +233,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     public async Task<List<ArchivoSICAS>> BuscarArchivosDigitales(string identity, long valuePK, CancellationToken ct = default)
     {
         string? token = await EnsureToken(ct);
-        if (token is null) return [];
+        if (token is null)
+        {
+            // Rastro, no evento: la causa raíz ya la reportó EnsureToken (ver ReadData).
+            _monitoreo.RastrearFallo("sicas.getfiles", "Sin token: no se listaron documentos",
+                ("identity", identity), ("valuepk", valuePK.ToString()));
+            return [];
+        }
 
         // /DigitalCenter/GetFiles con TypeReadBasic=true: lectura general del Centro Digital,
         // sin depender de la configuración especial por agente/corredor que usa GetFilesAdv
@@ -235,6 +262,15 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         {
             _log.LogWarning("GetFiles identity={Identity} valuePK={PK} falló: {Status}",
                 identity, valuePK, resp.StatusCode);
+
+            // Lista vacía = "esta póliza/siniestro no tiene documentos". El registro se guarda
+            // igual y nadie nota que sus documentos nunca se subieron.
+            _monitoreo.ReportarFalloSilencioso("sicas.getfiles",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al listar documentos",
+                "documentos-no-listados-se-lee-como-sin-documentos",
+                ("identity", identity),
+                ("valuepk", valuePK.ToString()),
+                ("status", ((int)resp.StatusCode).ToString()));
             return [];
         }
 
@@ -274,6 +310,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (!resp.IsSuccessStatusCode)
             {
                 _log.LogWarning("DownloadFile {Url} → {Status}", fileUrl, resp.StatusCode);
+
+                // El llamador trata el null como "documento no disponible" y sigue con el
+                // siguiente: la póliza queda guardada y sin ese documento, sin ninguna señal.
+                _monitoreo.ReportarFalloSilencioso("sicas.descargar-archivo",
+                    $"La descarga devolvió {(int)resp.StatusCode} ({resp.StatusCode})",
+                    "documento-no-descargado",
+                    ("archivo_url", fileUrl),
+                    ("status", ((int)resp.StatusCode).ToString()));
                 return null;
             }
 

@@ -2,12 +2,13 @@ using System.Globalization;
 using System.Text;
 using LumoSys.Integraciones.Domain.Seguros.Interfaces;
 using LumoSys.Integraciones.Domain.Seguros.Models;
+using LumoSys.Integraciones.Domain.Shared.Interfaces;
 using LumoSys.Integraciones.Infrastructure.Persistence.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace LumoSys.Integraciones.Infrastructure.Persistence.Repositories;
 
-public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
+public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monitoreo) : IPolizaRepository
 {
     private const int ESTATUS_VIGENTE = 177;
     private const int ESTATUS_SUSTITUCION = 497;
@@ -490,11 +491,28 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         // si no se puede vincular, se omite (limitación conocida del esquema, no un error).
         var compra = await db.ComprasDetalles.FirstOrDefaultAsync(x => x.CDE_NO_SERIE == serie, ct);
         if (compra is null)
+        {
+            // El PDF ya está físicamente en el FTP, pero sin fila en DOCUMENTOS_UNIDADES es
+            // invisible desde LumoSys: nadie lo va a encontrar y la fila de ARCHIVOS_REPOSITORIOS
+            // queda huérfana (ver "Pendiente/conocido" en CLAUDE.md). Salía en silencio absoluto.
+            monitoreo.ReportarFalloSilencioso("seguros.vincular-documento",
+                "No existe COMPRAS_DETALLES para la serie: el documento no se puede vincular",
+                "documento-subido-al-ftp-pero-invisible-en-lumosys",
+                ("serie", serie), ("archivo_id", archivoId.ToString()));
             return;
+        }
 
         var c = await db.Compras.FirstOrDefaultAsync(x => x.COM_ID == compra.CDE_COM_ID, ct);
         if (c?.COM_CLI_ID is not int cliId)
+        {
+            monitoreo.ReportarFalloSilencioso("seguros.vincular-documento",
+                "La compra de la serie no tiene cliente (COM_CLI_ID): el documento no se puede vincular",
+                "documento-subido-al-ftp-pero-invisible-en-lumosys",
+                ("serie", serie),
+                ("archivo_id", archivoId.ToString()),
+                ("compra_id", compra.CDE_COM_ID.ToString()));
             return;
+        }
 
         var doc = new DocumentosUnidadesModel
         {

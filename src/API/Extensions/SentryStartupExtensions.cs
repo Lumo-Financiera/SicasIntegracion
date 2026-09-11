@@ -114,16 +114,21 @@ public static class SentryStartupExtensions
     }
 
     /// <summary>
-    /// Descarta lo que no representa una falla real:
-    /// <list type="bullet">
-    /// <item>Cancelaciones — al detener el servicio de Windows, los <c>Task.Delay</c> de los cuatro
-    ///       BackgroundServices y las peticiones en vuelo lanzan <c>OperationCanceledException</c>;
-    ///       reportarlas convertiría cada reinicio en una ráfaga de alertas falsas.</item>
-    /// </list>
+    /// Descarta las cancelaciones <b>solo mientras el host se está deteniendo</b>: al parar el
+    /// servicio de Windows, los <c>Task.Delay</c> de los cuatro BackgroundServices y las peticiones
+    /// en vuelo lanzan <c>OperationCanceledException</c>, y reportarlas convertiría cada reinicio
+    /// o despliegue en una ráfaga de alertas falsas.
+    ///
+    /// <b>El condicionante del apagado no es opcional.</b> <c>HttpClient</c> lanza
+    /// <c>TaskCanceledException</c> —que hereda de <c>OperationCanceledException</c>— cuando vence
+    /// su <c>Timeout</c>, y en ese caso el token también aparece cancelado (lo cancela el propio
+    /// temporizador interno), así que el token no distingue un caso del otro. Descartar toda
+    /// cancelación dejaría fuera de Sentry justo el modo de falla más común de esta integración:
+    /// que SICAS, SFleet o el FTP dejen de responder.
     /// </summary>
     private static SentryEvent? DescartarRuido(SentryEvent evento, SentryHint _)
     {
-        if (EsCancelacion(evento.Exception))
+        if (ApagadoEnCurso.Activo && EsCancelacion(evento.Exception))
             return null;
 
         return evento;
@@ -150,6 +155,53 @@ public static class SentryStartupExtensions
 
         string version = typeof(SentryStartupExtensions).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
         return esDesarrollo ? $"v{version}-develop" : $"v{version}";
+    }
+
+
+    /// <summary>
+    /// Reporta una excepción que impidió arrancar el proceso. Corriendo como servicio de Windows
+    /// esta es la falla más silenciosa que existe: no hay petición que devuelva 500 ni ciclo de ETL
+    /// que falle, solo un servicio que no está y un ETL que deja de correr sin avisar.
+    ///
+    /// Si la falla ocurrió antes de que <c>UseSentry</c> alcanzara a inicializar el SDK (al enlazar
+    /// la configuración, por ejemplo), se inicializa aquí lo mínimo para no perder el aviso, y se
+    /// vacía la cola a mano porque el host nunca llegará a hacerlo.
+    /// </summary>
+    public static void ReportarFallaDeArranque(Exception ex)
+    {
+        try
+        {
+            if (!SentrySdk.IsEnabled)
+            {
+                string? dsn = new ConfigurationBuilder()
+                    .SetBasePath(AppContext.BaseDirectory)
+                    .AddJsonFile("appsettings.json", optional: true)
+                    .AddJsonFile("appsettings.Local.json", optional: true)
+                    .AddEnvironmentVariables()
+                    .Build()["Sentry:Dsn"];
+
+                if (string.IsNullOrWhiteSpace(dsn))
+                    return;
+
+                SentrySdk.Init(opciones =>
+                {
+                    opciones.Dsn             = dsn;
+                    opciones.Environment     = System.Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "production";
+                    opciones.ServerName      = System.Environment.MachineName;
+                    opciones.StackTraceMode  = StackTraceMode.Enhanced;
+                    opciones.DefaultTags["servicio"] = NombreServicio;
+                });
+            }
+
+            SentrySdk.CaptureException(ex, scope => scope.SetTag("operacion", "host.arranque"));
+            SentrySdk.Flush(TimeSpan.FromSeconds(5));
+        }
+        catch
+        {
+            // Reportar la falla de arranque nunca debe sustituir a la falla de arranque: si el
+            // propio reporte truena, se deja pasar para que la excepción original llegue al
+            // Visor de eventos de Windows, que es lo que el operador va a mirar.
+        }
     }
 
     /// <summary>Una clave presente pero vacía en appsettings cuenta como no configurada — así el

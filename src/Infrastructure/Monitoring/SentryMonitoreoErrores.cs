@@ -52,6 +52,21 @@ public sealed class SentryMonitoreoErrores : IMonitoreoErrores
             AplicarEtiquetas(scope, etiquetas);
         });
 
+    public void ReportarFalloSilencioso(string operacion, string motivo, string consecuencia,
+        params (string Clave, string? Valor)[] etiquetas) =>
+        // CaptureMessage y no CaptureException: no hay excepción que capturar, ese es justamente
+        // el problema. El mensaje lleva el punto de fallo al inicio para que Sentry agrupe todos
+        // los eventos del mismo punto en un solo issue.
+        SentrySdk.CaptureMessage($"[{operacion}] {motivo}", scope =>
+        {
+            scope.SetTag("operacion", operacion);
+            scope.SetTag("consecuencia", consecuencia);
+            // Permite filtrar en Sentry exactamente esta clase de falla: la que no produce
+            // excepción, no rompe nada visible y solo se nota cuando alguien echa de menos un dato.
+            scope.SetTag("fallo_silencioso", "si");
+            AplicarEtiquetas(scope, etiquetas);
+        }, SentryLevel.Error);
+
     private static void AplicarEtiquetas(Scope scope, (string Clave, string? Valor)[] etiquetas)
     {
         foreach (var (clave, valor) in etiquetas)

@@ -57,19 +57,30 @@ public sealed class ProcesarLoteSeguroHandler(
         monitoreo.Etiquetar("rango_hasta", hasta.ToString("dd/MM/yyyy HH:mm"));
 
         int ultimaPagina = 0;
+        int totalRegistros = 0;
         for (int pagina = 1; pagina <= 30; pagina++)
         {
             var polizas = await sicasClient.BuscarPolizasVigentes(desde, hasta, pagina, ct);
             if (polizas.Count == 0) break;
 
             ultimaPagina = pagina;
+            totalRegistros += polizas.Count;
             log.LogInformation("Página {Pagina}: {Count} pólizas", pagina, polizas.Count);
             monitoreo.Rastrear("seguros.barrido", $"Página {pagina}: {polizas.Count} pólizas",
                 ("pagina", pagina.ToString()), ("registros", polizas.Count.ToString()));
 
             foreach (var poliza in polizas)
             {
-                if (poliza.IDDocto is null) continue;
+                if (poliza.IDDocto is null)
+                {
+                    // Se saltaba sin dejar constancia: la póliza no se procesa nunca y el lote
+                    // termina declarándose completo.
+                    monitoreo.ReportarFalloSilencioso("seguros.procesar-lote",
+                        "SICAS devolvió una póliza sin IDDocto en el listado",
+                        "poliza-omitida-sin-procesar",
+                        ("poliza", poliza.Documento), ("pagina", pagina.ToString()));
+                    continue;
+                }
                 await ProcesarPolizaCompleta(poliza, ct);
                 await Task.Delay(300, ct); // evita ráfagas hacia SICAS (throttling observado en pruebas)
             }
@@ -83,7 +94,12 @@ public sealed class ProcesarLoteSeguroHandler(
             await bitacora.GuardarAsync(msg, NivelBitacora.Aviso, _idAplicacion, ct);
         }
 
-        log.LogInformation("Lote Seguros finalizado.");
+        // Queda como etiqueta de la corrida para poder alertar en Sentry sobre barridos que
+        // terminan "bien" con cero registros: ese fue el síntoma de los dos bugs de filtros de
+        // fecha, invisible durante semanas porque un lote vacío no falla.
+        monitoreo.Etiquetar("registros_encontrados", totalRegistros.ToString());
+
+        log.LogInformation("Lote Seguros finalizado. {Total} pólizas encontradas en el rango.", totalRegistros);
     }
 
     private async Task ProcesarPorSerie(string serie, CancellationToken ct)
@@ -147,6 +163,14 @@ public sealed class ProcesarLoteSeguroHandler(
             if (detalle is null)
             {
                 log.LogWarning("IDDocto={IDDocto}: faltan datos de detalle.", idDocto);
+
+                // Sin detalle no hay serie, así que la póliza no se guarda. Puede ser un dato
+                // incompleto en SICAS o un fallo de la consulta HWS_DDETAIL — desde aquí no se
+                // distingue, y por eso hay que verlo: la póliza se pierde en ambos casos.
+                monitoreo.ReportarFalloSilencioso("seguros.procesar-poliza",
+                    "HWS_DDETAIL no devolvió el detalle del vehículo",
+                    "poliza-no-guardada",
+                    ("iddocto", idDocto.ToString()), ("poliza", resumen.Documento));
                 return;
             }
 
@@ -167,6 +191,15 @@ public sealed class ProcesarLoteSeguroHandler(
             if (primas is null)
             {
                 log.LogWarning("IDDocto={IDDocto}: faltan datos de primas.", idDocto);
+
+                // Llega aquí habiendo confirmado ya que la serie SÍ es de la flotilla propia:
+                // es una póliza que nos corresponde y que se queda fuera de dbLumoSys.
+                monitoreo.ReportarFalloSilencioso("seguros.procesar-poliza",
+                    "H03400 no devolvió las primas de una póliza de la flotilla propia",
+                    "poliza-no-guardada",
+                    ("iddocto", idDocto.ToString()),
+                    ("poliza", resumen.Documento),
+                    ("serie", detalle.Serie));
                 return;
             }
 
@@ -202,6 +235,15 @@ public sealed class ProcesarLoteSeguroHandler(
                 {
                     log.LogWarning("No se pudo descargar el documento {Archivo} de la póliza {Poliza}.",
                         archivo.NombreArchivo, resumen.Documento);
+
+                    // DownloadFile ya reportó la causa técnica; esto añade a qué póliza pertenece,
+                    // que es el dato con el que se reprocesa a mano.
+                    monitoreo.ReportarFalloSilencioso("seguros.subir-documentos",
+                        "El documento no se pudo descargar de SICAS",
+                        "poliza-guardada-sin-este-documento",
+                        ("poliza", resumen.Documento),
+                        ("serie", detalle.Serie),
+                        ("archivo", archivo.NombreArchivo));
                     continue;
                 }
 

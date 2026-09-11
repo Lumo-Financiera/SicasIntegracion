@@ -41,4 +41,22 @@ public interface IMonitoreoErrores
     /// excepción se silencia deliberadamente por regla de negocio (si se re-lanza, basta con el
     /// <c>log.LogError</c> y el enriquecimiento del ámbito).</summary>
     void Capturar(Exception ex, string operacion, params (string Clave, string? Valor)[] etiquetas);
+
+    /// <summary>
+    /// Reporta un fallo que <b>no lanzó ninguna excepción</b>: los puntos donde el código devuelve
+    /// <c>null</c>, <c>0</c> o una lista vacía ante un error de un sistema externo y el llamador no
+    /// puede distinguir ese resultado de uno legítimo.
+    ///
+    /// Es la contraparte de <see cref="Capturar"/> para el caso más peligroso de este integrador:
+    /// un HTTP 500 de SICAS y un "no hay pólizas ese día" llegan al ETL exactamente igual —como
+    /// lista vacía— y el barrido termina declarándose exitoso. Ya ocurrió dos veces en producción
+    /// (el bug del formato de fecha y el del límite superior del filtro), ambas indetectadas
+    /// durante semanas porque no había ninguna señal que las distinguiera del silencio normal.
+    /// </summary>
+    /// <param name="operacion">El punto exacto del fallo, ej. <c>"sicas.readdata"</c>.</param>
+    /// <param name="motivo">Por qué falló, en una línea legible: <c>"SICAS respondió 500"</c>.</param>
+    /// <param name="consecuencia">Qué se perdió por ello, ej. <c>"pagina-descartada"</c> — es lo que
+    /// dice si hay que reprocesar algo a mano.</param>
+    void ReportarFalloSilencioso(string operacion, string motivo, string consecuencia,
+        params (string Clave, string? Valor)[] etiquetas);
 }

@@ -57,7 +57,11 @@ public sealed class FtpDocumentService(
                 return 1;
             }
 
-            log.LogWarning("FTP: {Archivo} no se subió (estado {Status})", nombreArchivo, status);
+            // LogError y no LogWarning: el resultado para el negocio es idéntico al de una
+            // excepción —el documento no quedó subido— y sin esto el caso no generaba ningún
+            // evento en Sentry, solo un rastro que nadie llegaría a ver.
+            log.LogError("FTP: {Archivo} no se subió a {Ruta} (estado {Status})",
+                nombreArchivo, rutaDestino, status);
             monitoreo.RastrearFallo("ftp.subida", $"{nombreArchivo} no se subió",
                 ("estado", status.ToString()), ("ruta", rutaDestino));
             return 0;

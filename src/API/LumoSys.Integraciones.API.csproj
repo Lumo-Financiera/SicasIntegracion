@@ -4,6 +4,10 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Sentry usa esta versión como "release" cuando Sentry:Release no está configurado.
+         SUBIRLA EN CADA DESPLIEGUE: es lo que permite a Sentry decir "este error empezó con la
+         versión de ayer" y marcar regresiones. Sin esto, todos los despliegues se ven iguales. -->
+    <Version>1.1.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

@@ -49,16 +49,23 @@ public sealed class SegurosEtlBackgroundService(
 
                 corrida.MarcarExito();
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 // Paro del servicio de Windows: no es una corrida fallida. Se re-lanza para
                 // conservar el comportamiento original (terminar ExecuteAsync), solo se marca
                 // antes para que el monitor programado no genere una alerta falsa.
+                //
+                // El filtro `when (stoppingToken.IsCancellationRequested)` es esencial: sin él,
+                // un Timeout de HttpClient contra SICAS llega aquí como TaskCanceledException
+                // (hereda de OperationCanceledException), se reportaría como corrida CORRECTA al
+                // monitor y el `throw;` mataría este servicio — y con él, todo el host.
                 corrida.MarcarCancelada();
                 throw;
             }
             catch (Exception ex)
             {
+                // Incluye los timeouts de red: se reportan como corrida fallida y NO se re-lanzan,
+                // para que una caída temporal de SICAS no tumbe el servicio de Windows entero.
                 corrida.MarcarFallo(ex);
                 log.LogError(ex, "ETL Seguros: error en ejecución programada.");
             }
