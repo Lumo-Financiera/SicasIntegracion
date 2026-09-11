@@ -19,6 +19,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Plantilla de configuración: se versiona (es la referencia de qué claves existen), pero no
+         tiene por qué viajar a la carpeta de publicación ni confundirse con el archivo real. -->
+    <Content Remove="appsettings.example.json" />
+    <None Include="appsettings.example.json" CopyToOutputDirectory="Never" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Application\LumoSys.Integraciones.Application.csproj" />
     <ProjectReference Include="..\Infrastructure\LumoSys.Integraciones.Infrastructure.csproj" />
   </ItemGroup>
