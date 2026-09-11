@@ -28,17 +28,20 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     private readonly string _usuario;
     private readonly string _contrasena;
     private readonly ILogger<SICASRestClient> _log;
+    private readonly IMonitoreoErrores _monitoreo;
 
     private string? _token;
     private DateTime _tokenExpira = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public SICASRestClient(IOptions<SICASOptions> opts, ILogger<SICASRestClient> log)
+    public SICASRestClient(
+        IOptions<SICASOptions> opts, IMonitoreoErrores monitoreo, ILogger<SICASRestClient> log)
     {
         _baseUrl    = opts.Value.BaseUrl.TrimEnd('/');
         _usuario    = opts.Value.Usuario;
         _contrasena = opts.Value.Contrasena;
         _log        = log;
+        _monitoreo  = monitoreo;
         _http       = new RestClient(opts.Value.BaseUrl);
     }
 
@@ -67,6 +70,8 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (!resp.IsSuccessStatusCode)
             {
                 _log.LogError("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                _monitoreo.RastrearFallo("sicas.token", "GetToken no respondió correctamente",
+                    ("status", resp.StatusCode.ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -76,6 +81,8 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (json["Sucess"]?.ToObject<bool>() != true)
             {
                 _log.LogError("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
+                _monitoreo.RastrearFallo("sicas.token", "SICAS rechazó la autenticación",
+                    ("mensaje", json["Message"]?.ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -103,7 +110,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     public async Task<List<T>?> ReadData<T>(SolicitudReadData solicitud, CancellationToken ct = default) where T : class
     {
         string? token = await EnsureToken(ct);
-        if (token is null) return null;
+        if (token is null)
+        {
+            // Rastro y no evento a propósito: EnsureToken ya reportó la causa raíz con LogError.
+            // Emitir aquí otro evento por cada consulta multiplicaría un solo fallo en decenas.
+            _monitoreo.RastrearFallo("sicas.readdata", $"Sin token: no se consultó {solicitud.KeyCode}",
+                ("keycode", solicitud.KeyCode), ("pagina", solicitud.Page.ToString()));
+            return null;
+        }
 
         var req = new RestRequest("Report/ReadData", Method.Post);
         req.AddHeader("Authorization", token);
@@ -120,6 +134,17 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         if (!resp.IsSuccessStatusCode || resp.Content is null)
         {
             _log.LogWarning("ReadData {KeyCode} falló: {Status}", solicitud.KeyCode, resp.StatusCode);
+
+            // Éste es el fallo silencioso más peligroso del integrador: los clientes de dominio
+            // convierten este null en lista vacía (`resp ?? []`), el barrido lo lee como "no hay
+            // registros", corta el recorrido de páginas y se declara exitoso. Sin este reporte,
+            // "SICAS está caído" y "hoy no hubo pólizas" son indistinguibles.
+            _monitoreo.ReportarFalloSilencioso("sicas.readdata",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al consultar {solicitud.KeyCode}",
+                "consulta-descartada-se-lee-como-sin-registros",
+                ("keycode", solicitud.KeyCode),
+                ("status", ((int)resp.StatusCode).ToString()),
+                ("pagina", solicitud.Page.ToString()));
             return null;
         }
 
@@ -143,11 +168,24 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
                 else
                 {
                     _log.LogWarning(ex, "JSON inválido en ReadData {KeyCode}", solicitud.KeyCode);
+                    // El JSON malformado de SICAS se repara hasta 5 veces; llegar aquí significa
+                    // que la reparación no alcanzó y ese registro se pierde en silencio.
+                    _monitoreo.Capturar(ex, "sicas.readdata",
+                        ("keycode", solicitud.KeyCode),
+                        ("pagina", solicitud.Page.ToString()),
+                        ("consecuencia", "respuesta-descartada-json-irreparable"));
                     return null;
                 }
             }
         }
 
+        // Se agotaron los 5 intentos de reparación sin conseguir un JSON válido. Mismo efecto que
+        // arriba: el llamador lo verá como "sin registros".
+        _monitoreo.ReportarFalloSilencioso("sicas.readdata",
+            $"JSON de {solicitud.KeyCode} sigue siendo inválido tras {maxReintentos} reparaciones",
+            "consulta-descartada-se-lee-como-sin-registros",
+            ("keycode", solicitud.KeyCode),
+            ("pagina", solicitud.Page.ToString()));
         return null;
     }
 
@@ -195,7 +233,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     public async Task<List<ArchivoSICAS>> BuscarArchivosDigitales(string identity, long valuePK, CancellationToken ct = default)
     {
         string? token = await EnsureToken(ct);
-        if (token is null) return [];
+        if (token is null)
+        {
+            // Rastro, no evento: la causa raíz ya la reportó EnsureToken (ver ReadData).
+            _monitoreo.RastrearFallo("sicas.getfiles", "Sin token: no se listaron documentos",
+                ("identity", identity), ("valuepk", valuePK.ToString()));
+            return [];
+        }
 
         // /DigitalCenter/GetFiles con TypeReadBasic=true: lectura general del Centro Digital,
         // sin depender de la configuración especial por agente/corredor que usa GetFilesAdv
@@ -218,6 +262,15 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         {
             _log.LogWarning("GetFiles identity={Identity} valuePK={PK} falló: {Status}",
                 identity, valuePK, resp.StatusCode);
+
+            // Lista vacía = "esta póliza/siniestro no tiene documentos". El registro se guarda
+            // igual y nadie nota que sus documentos nunca se subieron.
+            _monitoreo.ReportarFalloSilencioso("sicas.getfiles",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al listar documentos",
+                "documentos-no-listados-se-lee-como-sin-documentos",
+                ("identity", identity),
+                ("valuepk", valuePK.ToString()),
+                ("status", ((int)resp.StatusCode).ToString()));
             return [];
         }
 
@@ -237,6 +290,11 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
         catch (Exception ex)
         {
+            _monitoreo.Capturar(ex, "sicas.getfiles",
+                ("identity", identity),
+                ("valuepk", valuePK.ToString()),
+                ("consecuencia", "documentos-no-listados"));
+
             _log.LogWarning(ex, "Error parseando GetFiles");
             return [];
         }
@@ -252,6 +310,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (!resp.IsSuccessStatusCode)
             {
                 _log.LogWarning("DownloadFile {Url} → {Status}", fileUrl, resp.StatusCode);
+
+                // El llamador trata el null como "documento no disponible" y sigue con el
+                // siguiente: la póliza queda guardada y sin ese documento, sin ninguna señal.
+                _monitoreo.ReportarFalloSilencioso("sicas.descargar-archivo",
+                    $"La descarga devolvió {(int)resp.StatusCode} ({resp.StatusCode})",
+                    "documento-no-descargado",
+                    ("archivo_url", fileUrl),
+                    ("status", ((int)resp.StatusCode).ToString()));
                 return null;
             }
 
@@ -259,6 +325,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
         catch (Exception ex)
         {
+            // Se conserva el retorno null (el llamador lo trata como "documento no disponible" y
+            // sigue con el siguiente), pero se reporta: un documento que nunca llega es la falla
+            // más difícil de notar, porque la póliza/siniestro sí queda guardado.
+            _monitoreo.Capturar(ex, "sicas.descargar-archivo",
+                ("archivo_url", fileUrl),
+                ("consecuencia", "documento-no-descargado"));
+
             _log.LogError(ex, "Error descargando archivo {Url}", fileUrl);
             return null;
         }
