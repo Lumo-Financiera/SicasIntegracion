@@ -148,16 +148,28 @@ public sealed class SFleetClient(
         }
     }
 
+    /// <summary>
+    /// Alta o actualización de la póliza en SFleet.
+    ///
+    /// La ruta de edición lleva el id de la PÓLIZA en SFleet. Antes se le pasaba el id del
+    /// VEHÍCULO, de modo que un PATCH habría caído sobre la póliza cuyo id coincidiera con ese
+    /// número: una póliza de otro cliente del proveedor. No llegó a ocurrir solo porque SFleet
+    /// rechaza hoy todas las peticiones con 422 por campos faltantes; al corregir el payload, el
+    /// error se habría vuelto destructivo.
+    /// </summary>
     public async Task<int> GuardarPoliza(
-        SolicitudSFleet solicitud, bool esEdicion, int vehiculoId, CancellationToken ct = default)
+        SolicitudSFleet solicitud, int? polizaSFleetId, CancellationToken ct = default)
     {
         string? token = await ObtenerToken(ct);
         if (token is null) return 0;
 
+        // Fuera del try porque el catch también lo reporta.
+        bool esEdicion = polizaSFleetId.HasValue;
+
         try
         {
             var metodo = esEdicion ? Method.Patch : Method.Post;
-            var ruta   = esEdicion ? $"request_insurances/{vehiculoId}" : "request_insurances";
+            var ruta   = esEdicion ? $"request_insurances/{polizaSFleetId!.Value}" : "request_insurances";
 
             var req = new RestRequest(ruta, metodo);
             req.AddHeader("Authorization", $"Bearer {token}");
@@ -189,7 +201,8 @@ public sealed class SFleetClient(
                     "guardada-en-lumosys-sin-sincronizar-sfleet",
                     ("poliza", solicitud.NumeroPoliza),
                     ("operacion_sfleet", esEdicion ? "edicion" : "alta"),
-                    ("vehiculo_id", vehiculoId.ToString()),
+                    ("poliza_sfleet_id", polizaSFleetId?.ToString()),
+                    ("vehiculo_id", solicitud.ClienteVehiculoId.ToString()),
                     ("status", ((int)resp.StatusCode).ToString()));
                 return 0;
             }

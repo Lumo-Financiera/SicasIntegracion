@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Text;
 using LumoSys.Integraciones.Domain.Shared.Interfaces;
 using Microsoft.Extensions.Logging;
@@ -196,20 +198,68 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     /// </summary>
     private async Task<RestResponse> EjecutarConReintentos(RestRequest req, CancellationToken ct)
     {
-        const int maxIntentos = 3;
+        const int maxIntentos = 5;
         RestResponse resp;
         int intento = 1;
         while (true)
         {
             resp = await _http.ExecuteAsync(req, ct);
-            if (resp.IsSuccessStatusCode || resp.StatusCode != 0 || intento >= maxIntentos)
+
+            if (resp.IsSuccessStatusCode || intento >= maxIntentos || !EsTransitorio(resp))
                 return resp;
 
-            _log.LogDebug("Fallo de conexión con SICAS (intento {Intento}/{Max}), reintentando en {Segundos}s",
-                intento, maxIntentos, intento * 2);
-            await Task.Delay(TimeSpan.FromSeconds(intento * 2), ct);
+            TimeSpan espera = EsperaSugerida(resp) ?? TimeSpan.FromSeconds(Math.Pow(2, intento));
+
+            _log.LogWarning("SICAS respondió {Status} (intento {Intento}/{Max}); se reintenta en {Segundos}s",
+                resp.StatusCode == 0 ? "sin conexión" : resp.StatusCode.ToString(),
+                intento, maxIntentos, espera.TotalSeconds);
+
+            await Task.Delay(espera, ct);
             intento++;
         }
+    }
+
+    /// <summary>
+    /// Distingue el fallo que vale la pena reintentar del que no.
+    ///
+    /// Antes solo se reintentaba con <c>StatusCode == 0</c>, es decir cuando ni siquiera hubo
+    /// respuesta. Un 429 trae codigo valido, asi que salia al primer intento y la consulta se
+    /// descartaba: aguas arriba eso se leia como "este siniestro no existe en SICAS" -un aviso
+    /// rutinario- y el folio se quedaba sin sincronizar sin que nadie lo notara. Cuanto mas rapido
+    /// procesa el barrido, mas folios se pierden asi.
+    ///
+    /// No se reintenta un 401/403/404: ahi la respuesta no va a cambiar por insistir.
+    /// </summary>
+    private static bool EsTransitorio(RestResponse resp) =>
+        resp.StatusCode == 0                                  // no hubo respuesta
+        || resp.StatusCode == HttpStatusCode.TooManyRequests   // 429, el limite de tasa de SICAS
+        || resp.StatusCode == HttpStatusCode.RequestTimeout    // 408
+        || (int)resp.StatusCode is 502 or 503 or 504;          // caidas momentaneas del gateway
+
+    /// <summary>
+    /// Respeta el <c>Retry-After</c> cuando SICAS lo manda, en segundos o como fecha HTTP. Devuelve
+    /// null si no viene o no es interpretable, para caer al respaldo exponencial. Se acota a 60 s:
+    /// una espera mayor bloquearia el barrido mas de lo que conviene.
+    /// </summary>
+    private static TimeSpan? EsperaSugerida(RestResponse resp)
+    {
+        string? valor = resp.Headers?
+            .FirstOrDefault(h => string.Equals(h.Name, "Retry-After", StringComparison.OrdinalIgnoreCase))?
+            .Value?.ToString();
+
+        if (string.IsNullOrWhiteSpace(valor)) return null;
+
+        if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out int segundos))
+            return TimeSpan.FromSeconds(Math.Clamp(segundos, 1, 60));
+
+        if (DateTimeOffset.TryParse(valor, CultureInfo.InvariantCulture,
+                                    DateTimeStyles.AdjustToUniversal, out var cuando))
+        {
+            double faltan = (cuando - DateTimeOffset.UtcNow).TotalSeconds;
+            if (faltan > 0) return TimeSpan.FromSeconds(Math.Clamp(faltan, 1, 60));
+        }
+
+        return null;
     }
 
     private static List<T>? ExtraerFilas<T>(string json) where T : class

@@ -21,6 +21,17 @@ try
     // Sin efecto cuando se ejecuta interactivo (dotnet run / consola).
     builder.Host.UseWindowsService(opts => opts.ServiceName = "LumoSysIntegraciones");
 
+    // Verifica el grafo de dependencias al construir, no la primera vez que se usa. Sin esto, un
+    // servicio mal registrado no da la cara hasta que el ETL corre de madrugada y revienta ahí,
+    // con el servicio ya desplegado; con esto el fallo aparece al arrancar, que es cuando alguien
+    // está mirando. ValidateScopes además impide que un singleton capture algo Scoped —un
+    // DbContext, por ejemplo—, que es la forma clásica de corromper datos bajo concurrencia.
+    builder.Host.UseDefaultServiceProvider((_, opts) =>
+    {
+        opts.ValidateOnBuild = true;
+        opts.ValidateScopes  = true;
+    });
+
     // appsettings.Local.json: credenciales reales, nunca se versiona (está en .gitignore).
     builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 

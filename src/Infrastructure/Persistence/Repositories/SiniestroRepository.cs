@@ -10,6 +10,28 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
     private const byte TMO_ID_SINIESTROS = 11;
     private const string ESTATUS_SOLICITUD = "SOLICITUD";
 
+    /// <summary>
+    /// Largo maximo de SINIESTROS_ESTATUS.SES_COMENTARIOS. La columna es varchar(1000) y nada
+    /// recortaba: un comentario mas largo hacia fallar el INSERT entero con "String or binary data
+    /// would be truncated" y el siniestro se quedaba sin sincronizar, en silencio.
+    ///
+    /// El corte va en 999 y no en 1000 a proposito: los comentarios largos ya guardados miden
+    /// exactamente 999, de modo que el proceso anterior cortaba ahi. Usando el mismo corte,
+    /// <see cref="ExisteEstatusAsync"/> los reconoce; con 1000 no coincidirian y se insertarian de
+    /// nuevo en cada corrida.
+    /// </summary>
+    private const int LargoMaximoComentario = 999;
+
+    /// <summary>
+    /// Recorta el comentario a lo que admite la columna. No marca el recorte con puntos
+    /// suspensivos ni ningun otro sufijo: cualquier anadido cambiaria el texto y romperia la
+    /// comparacion por la que se deduplican los comentarios.
+    /// </summary>
+    private static string? Recortar(string? comentario) =>
+        comentario is { Length: > LargoMaximoComentario }
+            ? comentario[..LargoMaximoComentario]
+            : comentario;
+
     /// <summary>Traducción SICAS IdUser -> USUARIOS.USU_ID (EjecutivoSICAS del legacy).
     /// Tabla de mapeo manual — no existe catálogo ni regla que la derive.</summary>
     private static readonly Dictionary<int, int> EjecutivoSicasMap = new()
@@ -62,8 +84,25 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         byte torId = await ResolverTipoOrigenIdAsync(ct);
         int segId = await ResolverPolizaIdAsync(datos.NumeroPoliza, datos.Inciso, ct);
 
-        var existente = await db.Siniestros
-            .FirstOrDefaultAsync(x => x.SIN_CDE_ID == cdeId && x.SIN_NO_REPORTE == datos.NoReporte, ct);
+        // El identificador fiable es el IDSiniestro de SICAS, no el numero de reporte: SICAS puede
+        // tener VARIOS siniestros con el mismo NumReporte, cada uno en su poliza, y cada uno debe
+        // conservar su propio registro. Buscando solo por (vehiculo, reporte) los dos colapsaban en
+        // una sola fila y se sobreescribian entre si en cada corrida.
+        SiniestrosModel? existente = null;
+
+        if (datos.IDSiniestro.HasValue)
+            existente = await db.Siniestros
+                .FirstOrDefaultAsync(x => x.SIN_FOLIO_SICAS == datos.IDSiniestro, ct);
+
+        // Respaldo para los registros anteriores a que se guardara SIN_FOLIO_SICAS: se enganchan
+        // por (vehiculo, reporte), pero solo si no pertenecen ya a OTRO siniestro de SICAS. Sin esa
+        // condicion, el segundo siniestro del folio se apropiaria del registro que el primero acaba
+        // de vincular.
+        existente ??= await db.Siniestros
+            .FirstOrDefaultAsync(x => x.SIN_CDE_ID == cdeId
+                                   && x.SIN_NO_REPORTE == datos.NoReporte
+                                   && (x.SIN_FOLIO_SICAS == null
+                                       || x.SIN_FOLIO_SICAS == datos.IDSiniestro), ct);
 
         if (existente is null)
         {
@@ -114,8 +153,7 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
     {
         var polizas = await db.Seguros.Where(x => x.SEG_NO_POLIZA == numeroPoliza).ToListAsync(ct);
         if (polizas.Count == 0)
-            throw new InvalidOperationException(
-                $"La Póliza '{numeroPoliza}' no se encuentra registrada en SEGUROS.");
+            throw new PolizaNoRegistradaException(numeroPoliza);
 
         if (polizas.Count == 1)
             return polizas[0].SEG_ID;
@@ -196,14 +234,136 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         return EjecutivoSicasMap.GetValueOrDefault(idUserSicas, EjecutivoSicasDefault);
     }
 
+    /// <summary>
+    /// Compara por DIA, no por marca de tiempo exacta, y esa diferencia es deliberada: la UI de
+    /// LumoSys guarda estos comentarios con la hora en 00:00 (solo captura la fecha), mientras que
+    /// la bitacora de SICAS trae la hora real. Comparando la marca completa, el mismo comentario
+    /// capturado a mano a las 00:00 y traido de SICAS a las 10:51 se veian como dos distintos y se
+    /// insertaba de nuevo. Medido sobre 10 folios: de 237 comentarios de SICAS, 203 ya existian
+    /// capturados a mano y se habrian duplicado.
+    ///
+    /// Contrapartida asumida: si SICAS tuviera dos comentarios de texto identico el mismo dia a
+    /// horas distintas, se guardaria uno solo. Perder ese duplicado legitimo pesa mucho menos que
+    /// duplicar el historial completo.
+    /// </summary>
     public async Task<bool> ExisteEstatusAsync(
         int siniestroId, string comentarios, DateTime fechaRegistro, CancellationToken ct = default)
     {
+        // Se compara contra el texto recortado porque asi es como quedo guardado.
+        string texto = Recortar(comentarios)!;
+        DateTime dia = fechaRegistro.Date;
+
         return await db.SiniestrosEstatus
             .AnyAsync(x =>
                 x.SES_SIN_ID == siniestroId &&
-                x.SES_COMENTARIOS == comentarios &&
-                x.SES_FECHA_REGISTRO == fechaRegistro, ct);
+                x.SES_COMENTARIOS == texto &&
+                x.SES_FECHA_REGISTRO >= dia &&
+                x.SES_FECHA_REGISTRO < dia.AddDays(1), ct);
+    }
+
+    /// <summary>
+    /// Corrige el estatus de un comentario que YA existe, sin volver a insertarlo. Necesario
+    /// porque la deduplicacion impide reinsertarlo: sin esto, el mapeo de estatus solo arreglaria
+    /// los comentarios nuevos y los ya guardados seguirian mostrandose mal para siempre.
+    ///
+    /// Solo toca SES_TES_ID. No modifica el texto, ni la fecha, ni el usuario que lo registro.
+    /// </summary>
+    public async Task<int> CorregirTipoEstatusAsync(
+        int siniestroId, string comentarios, DateTime fechaRegistro, string estatusCorrecto,
+        CancellationToken ct = default)
+    {
+        int tesId = await ResolverTipoEstatusIdAsync(estatusCorrecto, ct);
+        string texto = Recortar(comentarios)!;
+        DateTime dia = fechaRegistro.Date;
+
+        var filas = await db.SiniestrosEstatus
+            .Where(x => x.SES_SIN_ID == siniestroId &&
+                        x.SES_COMENTARIOS == texto &&
+                        x.SES_FECHA_REGISTRO >= dia &&
+                        x.SES_FECHA_REGISTRO < dia.AddDays(1) &&
+                        x.SES_TES_ID != tesId)
+            .ToListAsync(ct);
+
+        if (filas.Count == 0) return 0;
+
+        foreach (var fila in filas)
+            fila.SES_TES_ID = tesId;
+
+        await db.SaveChangesAsync(ct);
+        return filas.Count;
+    }
+
+    /// <summary>
+    /// Deja el estatus que LumoSys MUESTRA igual al que reporta SICAS.
+    ///
+    /// La vista toma el comentario de fecha/hora mas reciente, y ese no siempre es el ultimo de
+    /// SICAS: SICAS manda muchos comentarios sin hora, que se guardan a las 00:00 y quedan por
+    /// debajo de otro del mismo dia que si traia hora. Por eso habia siniestros perfectamente
+    /// sincronizados -"0 nuevos y 0 reetiquetados"- que aun asi se seguian viendo abiertos.
+    ///
+    /// Solo cambia SES_TES_ID de esa fila y no inserta nada. Devuelve true si tuvo que cambiarla.
+    /// </summary>
+    public async Task<bool> AlinearEstatusEfectivoAsync(
+        int siniestroId, string estatusOficial, CancellationToken ct = default)
+    {
+        int tesId = await ResolverTipoEstatusIdAsync(estatusOficial, ct);
+
+        var efectivo = await db.SiniestrosEstatus
+            .Where(x => x.SES_SIN_ID == siniestroId)
+            .OrderByDescending(x => x.SES_FECHA_REGISTRO)
+            .ThenByDescending(x => x.SES_ID)
+            .FirstOrDefaultAsync(ct);
+
+        if (efectivo is null || efectivo.SES_TES_ID == tesId) return false;
+
+        efectivo.SES_TES_ID = tesId;
+        await db.SaveChangesAsync(ct);
+        return true;
+    }
+
+    /// <summary>
+    /// Siniestros que LumoSys muestra abiertos: su comentario vigente es EN TRAMITE o SOLICITUD.
+    /// Es la entrada de la fase de reconciliacion; ver <see cref="SiniestroAbierto"/> para el
+    /// porque de que haga falta.
+    /// </summary>
+    public async Task<List<SiniestroAbierto>> ObtenerSiniestrosAbiertosAsync(CancellationToken ct = default)
+    {
+        var idsAbiertos = await db.TiposEstatus
+            .Where(t => t.TES_TMO_ID == TMO_ID_SINIESTROS
+                     && (t.TES_DESCRIPCION == "EN TRAMITE" || t.TES_DESCRIPCION == ESTATUS_SOLICITUD))
+            .Select(t => t.TES_ID)
+            .ToListAsync(ct);
+
+        return await db.Siniestros
+            .Where(s => s.SIN_NO_REPORTE != null
+                     && idsAbiertos.Contains(
+                            db.SiniestrosEstatus
+                              .Where(e => e.SES_SIN_ID == s.SIN_ID)
+                              .OrderByDescending(e => e.SES_FECHA_REGISTRO)
+                              .ThenByDescending(e => e.SES_ID)
+                              .Select(e => e.SES_TES_ID)
+                              .FirstOrDefault()))
+            .OrderByDescending(s => s.SIN_ID)
+            .Select(s => new SiniestroAbierto(
+                s.SIN_ID,
+                s.SIN_NO_REPORTE!,
+                s.SIN_FOLIO_SICAS,
+                db.TiposEstatus
+                  .Where(t => t.TES_ID == db.SiniestrosEstatus
+                        .Where(e => e.SES_SIN_ID == s.SIN_ID)
+                        .OrderByDescending(e => e.SES_FECHA_REGISTRO)
+                        .ThenByDescending(e => e.SES_ID)
+                        .Select(e => e.SES_TES_ID)
+                        .FirstOrDefault())
+                  .Select(t => t.TES_DESCRIPCION)
+                  .FirstOrDefault() ?? string.Empty,
+                db.SiniestrosEstatus
+                  .Where(e => e.SES_SIN_ID == s.SIN_ID)
+                  .OrderByDescending(e => e.SES_FECHA_REGISTRO)
+                  .ThenByDescending(e => e.SES_ID)
+                  .Select(e => e.SES_FECHA_REGISTRO)
+                  .FirstOrDefault()))
+            .ToListAsync(ct);
     }
 
     public async Task UpsertEstatusAsync(DatosEstatus datos, int siniestroId, CancellationToken ct = default)
@@ -211,11 +371,12 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         int tesId = await ResolverTipoEstatusIdAsync(datos.Estatus, ct);
         int usuId = await ResolverUsuarioEstatusIdAsync(datos.Estatus, datos.Ejecutivo, datos.IdUser, ct);
         DateTime fechaRegistro = datos.FechaRegistro ?? DateTime.Now;
+        string? comentarios = Recortar(datos.Comentarios);
 
         var existente = await db.SiniestrosEstatus
             .FirstOrDefaultAsync(x =>
                 x.SES_SIN_ID == siniestroId &&
-                x.SES_COMENTARIOS == datos.Comentarios &&
+                x.SES_COMENTARIOS == comentarios &&
                 x.SES_FECHA_REGISTRO == fechaRegistro, ct);
 
         if (existente is null)
@@ -224,7 +385,7 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
             {
                 SES_SIN_ID         = siniestroId,
                 SES_TES_ID         = tesId,
-                SES_COMENTARIOS    = datos.Comentarios,
+                SES_COMENTARIOS    = comentarios,
                 SES_FECHA_REGISTRO = fechaRegistro,
                 SES_USU_ID         = usuId
             });
@@ -233,7 +394,7 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         {
             existente.SES_TES_ID      = tesId;
             existente.SES_USU_ID      = usuId;
-            existente.SES_COMENTARIOS = datos.Comentarios;
+            existente.SES_COMENTARIOS = comentarios;
         }
 
         await db.SaveChangesAsync(ct);

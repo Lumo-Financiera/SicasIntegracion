@@ -79,7 +79,12 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
                 : null;
 
         bool esNuevo = existente is null;
-        if (esNuevo)
+
+        // Se comprueba `existente is null` en vez de `esNuevo` para que el compilador pueda ver
+        // que después de este bloque la referencia ya no es nula. Son equivalentes, pero con la
+        // variable intermedia el análisis de nulidad se pierde y avisa de una desreferencia que
+        // en realidad no puede ocurrir.
+        if (existente is null)
         {
             existente = new SegurosDetallesModel
             {
