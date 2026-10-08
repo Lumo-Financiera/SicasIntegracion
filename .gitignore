@@ -13,6 +13,10 @@ publish/
 .claude/
 
 ## Secretos locales — nunca versionar
+## appsettings.json se ignora porque es el archivo que la app lee de verdad y, al editarlo en
+## el servidor o en local, es donde terminan las credenciales reales. La plantilla con la lista
+## de claves y sus PLACEHOLDER vive en appsettings.example.json, que sí se versiona.
+appsettings.json
 appsettings.Local.json
 appsettings.*.Local.json
 *.pfx

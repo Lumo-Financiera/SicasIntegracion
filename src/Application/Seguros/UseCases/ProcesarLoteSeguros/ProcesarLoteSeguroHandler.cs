@@ -17,21 +17,37 @@ public sealed class ProcesarLoteSeguroHandler(
     GuardarPolizaHandler guardarHandler,
     SubirDocumentoPolizaHandler subirHandler,
     IBitacoraRepository bitacora,
+    IMonitoreoErrores monitoreo,
     IOptions<AplicacionOptions> opciones,
     ILogger<ProcesarLoteSeguroHandler> log)
 {
     private readonly int _idAplicacion = opciones.Value.Seguros;
 
+    // Saldo de la corrida para los dos servicios externos que fallan de forma repetida. Se reporta
+    // una vez al final, con el conteo, en lugar de una vez por documento o por póliza: el reporte
+    // individual producía cientos de eventos idénticos por noche sobre problemas ya conocidos.
+    private int _documentosIntentados;
+    private int _documentosFallidos;
+    private int _sfleetIntentos;
+    private int _sfleetFallos;
+
     public async Task Handle(ProcesarLoteSeguroCommand cmd, CancellationToken ct = default)
     {
+        // El disparador queda etiquetado desde el primer momento: en Sentry es la diferencia
+        // entre "falló el barrido automático" y "falló un reprocesamiento que alguien pidió a
+        // mano por la API", que se atienden de forma distinta.
+        monitoreo.Etiquetar("modulo", "Seguros");
+
         if (!string.IsNullOrWhiteSpace(cmd.Poliza))
         {
+            monitoreo.Etiquetar("disparador", "manual-poliza");
             await ProcesarPorDocumento(cmd.Poliza, ct);
             return;
         }
 
         if (!string.IsNullOrWhiteSpace(cmd.Serie))
         {
+            monitoreo.Etiquetar("disparador", "manual-serie");
             await ProcesarPorSerie(cmd.Serie, ct);
             return;
         }
@@ -43,18 +59,49 @@ public sealed class ProcesarLoteSeguroHandler(
     {
         log.LogInformation("Iniciando lote Seguros {Desde:dd/MM/yyyy} → {Hasta:dd/MM/yyyy}", desde, hasta);
 
+        // Cubre el lote pedido por la API (el disparado por los BackgroundServices ya trae estas
+        // etiquetas desde la corrida; volver a fijarlas es idempotente).
+        monitoreo.Etiquetar("rango_desde", desde.ToString("dd/MM/yyyy HH:mm"));
+        monitoreo.Etiquetar("rango_hasta", hasta.ToString("dd/MM/yyyy HH:mm"));
+
         int ultimaPagina = 0;
+        int totalRegistros = 0;
         for (int pagina = 1; pagina <= 30; pagina++)
         {
-            var polizas = await sicasClient.BuscarPolizasVigentes(desde, hasta, pagina, ct);
+            List<PolizaResumenSICAS> polizas;
+            try
+            {
+                polizas = await sicasClient.BuscarPolizasVigentes(desde, hasta, pagina, ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                // Mismo criterio que en Siniestros: una pagina que falle no se lleva el resto.
+                monitoreo.Capturar(ex, "seguros.barrido",
+                    ("pagina", pagina.ToString()), ("consecuencia", "pagina-omitida-el-lote-continua"));
+                log.LogError(ex, "Error leyendo la página {Pagina} del barrido de pólizas; se continúa.", pagina);
+                continue;
+            }
+
             if (polizas.Count == 0) break;
 
             ultimaPagina = pagina;
+            totalRegistros += polizas.Count;
             log.LogInformation("Página {Pagina}: {Count} pólizas", pagina, polizas.Count);
+            monitoreo.Rastrear("seguros.barrido", $"Página {pagina}: {polizas.Count} pólizas",
+                ("pagina", pagina.ToString()), ("registros", polizas.Count.ToString()));
 
             foreach (var poliza in polizas)
             {
-                if (poliza.IDDocto is null) continue;
+                if (poliza.IDDocto is null)
+                {
+                    // Se saltaba sin dejar constancia: la póliza no se procesa nunca y el lote
+                    // termina declarándose completo.
+                    monitoreo.ReportarFalloSilencioso("seguros.procesar-lote",
+                        "SICAS devolvió una póliza sin IDDocto en el listado",
+                        "poliza-omitida-sin-procesar",
+                        ("poliza", poliza.Documento), ("pagina", pagina.ToString()));
+                    continue;
+                }
                 await ProcesarPolizaCompleta(poliza, ct);
                 await Task.Delay(300, ct); // evita ráfagas hacia SICAS (throttling observado en pruebas)
             }
@@ -65,10 +112,17 @@ public sealed class ProcesarLoteSeguroHandler(
             string msg = $"Barrido de pólizas {desde:dd/MM/yyyy}-{hasta:dd/MM/yyyy} alcanzó el límite de 30 páginas " +
                          "(3,000 registros) — es posible que existan más pólizas sin procesar en este rango.";
             log.LogWarning(msg);
-            await bitacora.GuardarAsync(msg, NivelBitacora.Aviso, _idAplicacion, ct);
+            await RegistrarEnBitacora(msg, NivelBitacora.Aviso, ct);
         }
 
-        log.LogInformation("Lote Seguros finalizado.");
+        // Queda como etiqueta de la corrida para poder alertar en Sentry sobre barridos que
+        // terminan "bien" con cero registros: ese fue el síntoma de los dos bugs de filtros de
+        // fecha, invisible durante semanas porque un lote vacío no falla.
+        monitoreo.Etiquetar("registros_encontrados", totalRegistros.ToString());
+
+        ReportarResumenExterno();
+
+        log.LogInformation("Lote Seguros finalizado. {Total} pólizas encontradas en el rango.", totalRegistros);
     }
 
     private async Task ProcesarPorSerie(string serie, CancellationToken ct)
@@ -79,7 +133,7 @@ public sealed class ProcesarLoteSeguroHandler(
         if (detalle?.IDDocto is null)
         {
             log.LogWarning("Serie {Serie} no encontrada en SICAS.", serie);
-            await bitacora.GuardarAsync($"Serie {serie} no encontrada en SICAS.", NivelBitacora.Aviso, _idAplicacion, ct);
+            await RegistrarEnBitacora($"Serie {serie} no encontrada en SICAS.", NivelBitacora.Aviso, ct);
             return;
         }
 
@@ -101,7 +155,7 @@ public sealed class ProcesarLoteSeguroHandler(
         if (idDocto is null)
         {
             log.LogWarning("Póliza {Documento} no encontrada en SICAS.", documento);
-            await bitacora.GuardarAsync($"Póliza {documento} no encontrada en SICAS.", NivelBitacora.Aviso, _idAplicacion, ct);
+            await RegistrarEnBitacora($"Póliza {documento} no encontrada en SICAS.", NivelBitacora.Aviso, ct);
             return;
         }
 
@@ -115,9 +169,66 @@ public sealed class ProcesarLoteSeguroHandler(
         await ProcesarPolizaCompleta(resumen, ct);
     }
 
+    /// <summary>
+    /// Emite el saldo de los servicios externos de toda la corrida, en vez de un evento por cada
+    /// documento y cada póliza.
+    ///
+    /// Cuando falla el 100% el problema no es de un registro sino del servicio, y entonces sí
+    /// alerta: significa que ninguna póliza de hoy llegó a SFleet, o que ningún documento se
+    /// almacenó. Un fallo parcial queda registrado sin notificar, y si no hubo fallos no se emite
+    /// nada.
+    /// </summary>
+    private void ReportarResumenExterno()
+    {
+        if (_documentosFallidos > 0)
+        {
+            string motivo = $"{_documentosFallidos} de {_documentosIntentados} documentos de póliza no se pudieron almacenar";
+
+            if (_documentosFallidos == _documentosIntentados)
+                monitoreo.ReportarFalloCritico("seguros.documentos", motivo,
+                    "ninguna-poliza-de-la-corrida-tiene-sus-documentos",
+                    ("documentos_fallidos", _documentosFallidos.ToString()),
+                    ("documentos_intentados", _documentosIntentados.ToString()));
+            else
+                monitoreo.ReportarFalloSilencioso("seguros.documentos", motivo,
+                    "esas-polizas-quedaron-sin-parte-de-su-documentacion",
+                    ("documentos_fallidos", _documentosFallidos.ToString()),
+                    ("documentos_intentados", _documentosIntentados.ToString()));
+
+            log.LogWarning("Documentos de la corrida: {Fallidos} de {Intentados} no se almacenaron.",
+                _documentosFallidos, _documentosIntentados);
+        }
+
+        if (_sfleetFallos > 0)
+        {
+            string motivo = $"{_sfleetFallos} de {_sfleetIntentos} pólizas no se pudieron sincronizar con SFleet";
+
+            if (_sfleetFallos == _sfleetIntentos)
+                monitoreo.ReportarFalloCritico("seguros.sfleet", motivo,
+                    "ninguna-poliza-de-la-corrida-llego-a-sfleet",
+                    ("sfleet_fallos", _sfleetFallos.ToString()),
+                    ("sfleet_intentos", _sfleetIntentos.ToString()));
+            else
+                monitoreo.ReportarFalloSilencioso("seguros.sfleet", motivo,
+                    "esas-polizas-viven-solo-en-lumosys",
+                    ("sfleet_fallos", _sfleetFallos.ToString()),
+                    ("sfleet_intentos", _sfleetIntentos.ToString()));
+
+            log.LogWarning("SFleet en la corrida: {Fallos} de {Intentos} pólizas no se sincronizaron.",
+                _sfleetFallos, _sfleetIntentos);
+        }
+    }
+
     private async Task ProcesarPolizaCompleta(PolizaResumenSICAS resumen, CancellationToken ct)
     {
         int idDocto = resumen.IDDocto!.Value;
+
+        // Un ámbito por póliza: el contexto (IDDocto, folio) viaja con cualquier error que ocurra
+        // más abajo — incluidos los que reportan los clientes de SICAS/FTP — y se descarta al
+        // pasar a la siguiente póliza, sin arrastrar datos de la anterior.
+        using var ambito = monitoreo.IniciarAmbito("seguros.procesar-poliza",
+            ("iddocto", idDocto.ToString()),
+            ("poliza", resumen.Documento));
 
         try
         {
@@ -125,6 +236,14 @@ public sealed class ProcesarLoteSeguroHandler(
             if (detalle is null)
             {
                 log.LogWarning("IDDocto={IDDocto}: faltan datos de detalle.", idDocto);
+
+                // Sin detalle no hay serie, así que la póliza no se guarda. Puede ser un dato
+                // incompleto en SICAS o un fallo de la consulta HWS_DDETAIL — desde aquí no se
+                // distingue, y por eso hay que verlo: la póliza se pierde en ambos casos.
+                monitoreo.ReportarFalloSilencioso("seguros.procesar-poliza",
+                    "HWS_DDETAIL no devolvió el detalle del vehículo",
+                    "poliza-no-guardada",
+                    ("iddocto", idDocto.ToString()), ("poliza", resumen.Documento));
                 return;
             }
 
@@ -145,8 +264,19 @@ public sealed class ProcesarLoteSeguroHandler(
             if (primas is null)
             {
                 log.LogWarning("IDDocto={IDDocto}: faltan datos de primas.", idDocto);
+
+                // Llega aquí habiendo confirmado ya que la serie SÍ es de la flotilla propia:
+                // es una póliza que nos corresponde y que se queda fuera de dbLumoSys.
+                monitoreo.ReportarFalloSilencioso("seguros.procesar-poliza",
+                    "H03400 no devolvió las primas de una póliza de la flotilla propia",
+                    "poliza-no-guardada",
+                    ("iddocto", idDocto.ToString()),
+                    ("poliza", resumen.Documento),
+                    ("serie", detalle.Serie));
                 return;
             }
+
+            monitoreo.Etiquetar("serie", detalle.Serie);
 
             var cmd = ConstruirComando(resumen, detalle, primas, coberturas, cobranza);
             var resultado = await guardarHandler.Handle(cmd, ct);
@@ -160,20 +290,35 @@ public sealed class ProcesarLoteSeguroHandler(
                 }
 
                 log.LogError("Error guardando póliza {Poliza}: {Mensaje}", resumen.Documento, resultado.Mensaje);
-                await bitacora.GuardarAsync($"Error guardando póliza {resumen.Documento}: {resultado.Mensaje}",
-                    NivelBitacora.Error, _idAplicacion, ct);
+                await RegistrarEnBitacora($"Error guardando póliza {resumen.Documento}: {resultado.Mensaje}",
+                    NivelBitacora.Error, ct);
                 return;
             }
+
+            monitoreo.Rastrear("seguros.guardado", $"Póliza {resumen.Documento} guardada",
+                ("poliza_id", resultado.PolizaId?.ToString()),
+                ("vehiculo_id", resultado.VehiculoId?.ToString()));
 
             // Subir documentos directamente desde SICAS (sin disco local)
             log.LogInformation("IDDocto={IDDocto}: SICAS devolvió {Count} archivo(s) digitales.", idDocto, archivos.Count);
             foreach (var archivo in archivos.Where(a => !string.IsNullOrEmpty(a.PathWWW)))
             {
+                try
+                {
+                _documentosIntentados++;
+
                 var bytes = await sicasRestClient.DownloadFile(archivo.PathWWW!, ct);
                 if (bytes is null || bytes.Length == 0)
                 {
                     log.LogWarning("No se pudo descargar el documento {Archivo} de la póliza {Poliza}.",
                         archivo.NombreArchivo, resumen.Documento);
+
+                    // Rastro y no evento: el saldo de toda la corrida se reporta una sola vez al
+                    // final. DownloadFile ya dejó la causa técnica registrada.
+                    _documentosFallidos++;
+                    monitoreo.RastrearFallo("seguros.subir-documentos",
+                        $"No se pudo descargar de SICAS el documento {archivo.NombreArchivo}",
+                        ("poliza", resumen.Documento), ("serie", detalle.Serie));
                     continue;
                 }
 
@@ -183,6 +328,20 @@ public sealed class ProcesarLoteSeguroHandler(
                     NombreArchivo = archivo.NombreArchivo,
                     Bytes         = bytes
                 }, ct);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    // El FTP lleva caído desde agosto de 2026: sin esto, el primer documento que
+                    // falla deja a la póliza sin los siguientes y aborta su procesamiento, que
+                    // incluye la sincronización con SFleet.
+                    _documentosFallidos++;
+                    monitoreo.Capturar(ex, "seguros.subir-documentos",
+                        ("poliza", resumen.Documento),
+                        ("archivo", archivo.NombreArchivo),
+                        ("consecuencia", "documento-omitido-la-poliza-continua"));
+                    log.LogError(ex, "Error subiendo el documento {Archivo} de la póliza {Poliza}; se continúa.",
+                        archivo.NombreArchivo, resumen.Documento);
+                }
             }
 
             // Sincronizar con SFleet
@@ -194,9 +353,17 @@ public sealed class ProcesarLoteSeguroHandler(
         }
         catch (Exception ex)
         {
+            // No se re-lanza a propósito, y esa es la regla de negocio: una póliza con datos malos
+            // en SICAS no debe abortar el resto del barrido. Justo por eso hay que reportarla —
+            // de lo contrario el lote termina "sin errores" con registros silenciosamente perdidos.
+            monitoreo.Capturar(ex, "seguros.procesar-poliza",
+                ("iddocto", idDocto.ToString()),
+                ("poliza", resumen.Documento),
+                ("consecuencia", "poliza-omitida-lote-continua"));
+
             log.LogError(ex, "Error procesando IDDocto={IDDocto}", idDocto);
-            await bitacora.GuardarAsync($"Error procesando póliza IDDocto={idDocto}: {ex.Message}",
-                NivelBitacora.Error, _idAplicacion, ct);
+            await RegistrarEnBitacora($"Error procesando póliza IDDocto={idDocto}: {ex.Message}",
+                NivelBitacora.Error, ct);
         }
     }
 
@@ -219,7 +386,6 @@ public sealed class ProcesarLoteSeguroHandler(
             }
 
             int? polizaSFleetId = await sfleetClient.BuscarPoliza(resumen.Documento ?? string.Empty, ct);
-            bool esEdicion = polizaSFleetId.HasValue;
 
             var solicitud = new LumoSys.Integraciones.Domain.Seguros.Models.SolicitudSFleet
             {
@@ -234,11 +400,41 @@ public sealed class ProcesarLoteSeguroHandler(
                 ClienteVehiculoId = vehiculoSFleet.Value
             };
 
-            await sfleetClient.GuardarPoliza(solicitud, esEdicion, vehiculoSFleet.Value, ct);
+            // Se manda el id de la PÓLIZA, no el del vehículo: ese ya viaja en ClienteVehiculoId.
+            _sfleetIntentos++;
+            int idEnSFleet = await sfleetClient.GuardarPoliza(solicitud, polizaSFleetId, ct);
+            if (idEnSFleet == 0) _sfleetFallos++;
         }
         catch (Exception ex)
         {
+            // Silenciado deliberado: la póliza ya quedó guardada en dbLumoSys y el ETL no debe
+            // deshacerla porque SFleet (sistema aparte) esté caído o rechace la petición. Se
+            // reporta con la marca de que quedó desincronizada, que es la acción pendiente real.
+            monitoreo.Capturar(ex, "seguros.sincronizar-sfleet",
+                ("poliza", resumen.Documento),
+                ("serie", detalle.Serie),
+                ("vehiculo_id", vehiculoId.ToString()),
+                ("consecuencia", "guardada-en-lumosys-sin-sincronizar-sfleet"));
+
             log.LogError(ex, "Error sincronizando SFleet para póliza {Poliza}", resumen.Documento);
+        }
+    }
+
+    /// <summary>
+    /// Deja constancia en la bitácora sin arriesgar el lote. Ver el comentario equivalente en
+    /// ProcesarLoteSiniestroHandler: escribir el registro es otro acceso a dbLumoSys, y hacerlo
+    /// desde dentro de un catch puede abortar el barrido justo cuando la base es lo que falla.
+    /// </summary>
+    private async Task RegistrarEnBitacora(string mensaje, NivelBitacora nivel, CancellationToken ct)
+    {
+        try
+        {
+            await bitacora.GuardarAsync(mensaje, nivel, _idAplicacion, ct);
+        }
+        catch (Exception ex)
+        {
+            monitoreo.Capturar(ex, "seguros.bitacora-escritura", ("mensaje", mensaje));
+            log.LogError(ex, "No se pudo registrar en la bitácora: {Mensaje}", mensaje);
         }
     }
 
@@ -277,7 +473,10 @@ public sealed class ProcesarLoteSeguroHandler(
 
         return new GuardarPolizaCommand
         {
-            Poliza                 = resumen.Documento,
+            // Si SICAS mandara el documento vacío, se propaga como cadena vacía y GuardarPolizaHandler
+            // lo rechaza con "Número de póliza requerido". Dejarlo pasar como null solo cambiaría
+            // ese mensaje claro por una referencia nula más abajo.
+            Poliza                 = resumen.Documento ?? string.Empty,
             Aseguradora            = resumen.CiaAbreviacion,
             Beneficiario           = primas.Beneficiario,
             BeneficiarioPreferente = string.IsNullOrEmpty(primas.Beneficiario) ? "PENDIENTE" : null,

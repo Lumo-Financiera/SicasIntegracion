@@ -4,13 +4,25 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Sentry usa esta versión como "release" cuando Sentry:Release no está configurado.
+         SUBIRLA EN CADA DESPLIEGUE: es lo que permite a Sentry decir "este error empezó con la
+         versión de ayer" y marcar regresiones. Sin esto, todos los despliegues se ven iguales. -->
+    <Version>1.1.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.18" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="9.0.6" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="9.0.6" />
+    <PackageReference Include="Sentry.AspNetCore" Version="6.10.0" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="7.3.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Plantilla de configuración: se versiona (es la referencia de qué claves existen), pero no
+         tiene por qué viajar a la carpeta de publicación ni confundirse con el archivo real. -->
+    <Content Remove="appsettings.example.json" />
+    <None Include="appsettings.example.json" CopyToOutputDirectory="Never" />
   </ItemGroup>
 
   <ItemGroup>

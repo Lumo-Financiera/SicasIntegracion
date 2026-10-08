@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Text;
 using LumoSys.Integraciones.Domain.Shared.Interfaces;
 using Microsoft.Extensions.Logging;
@@ -28,17 +30,20 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     private readonly string _usuario;
     private readonly string _contrasena;
     private readonly ILogger<SICASRestClient> _log;
+    private readonly IMonitoreoErrores _monitoreo;
 
     private string? _token;
     private DateTime _tokenExpira = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public SICASRestClient(IOptions<SICASOptions> opts, ILogger<SICASRestClient> log)
+    public SICASRestClient(
+        IOptions<SICASOptions> opts, IMonitoreoErrores monitoreo, ILogger<SICASRestClient> log)
     {
         _baseUrl    = opts.Value.BaseUrl.TrimEnd('/');
         _usuario    = opts.Value.Usuario;
         _contrasena = opts.Value.Contrasena;
         _log        = log;
+        _monitoreo  = monitoreo;
         _http       = new RestClient(opts.Value.BaseUrl);
     }
 
@@ -66,7 +71,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             using var resp = await _authHttp.PostAsync(url, new StringContent(string.Empty), ct);
             if (!resp.IsSuccessStatusCode)
             {
-                _log.LogError("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                // Critico: sin token no se puede hacer NINGUNA consulta a SICAS, asi que no se
+                // sincroniza ni un registro. El log baja a Warning para no emitir un segundo
+                // evento del mismo fallo a traves del puente de ILogger.
+                _log.LogWarning("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                _monitoreo.ReportarFalloCritico("sicas.token",
+                    $"SICAS no entregó token: respondió {(int)resp.StatusCode} ({resp.StatusCode})",
+                    "ningun-registro-se-sincroniza-desde-sicas",
+                    ("status", ((int)resp.StatusCode).ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -75,7 +87,11 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
 
             if (json["Sucess"]?.ToObject<bool>() != true)
             {
-                _log.LogError("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
+                _log.LogWarning("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
+                _monitoreo.ReportarFalloCritico("sicas.token",
+                    "SICAS rechazó la autenticación",
+                    "ningun-registro-se-sincroniza-desde-sicas",
+                    ("mensaje", json["Message"]?.ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -103,7 +119,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     public async Task<List<T>?> ReadData<T>(SolicitudReadData solicitud, CancellationToken ct = default) where T : class
     {
         string? token = await EnsureToken(ct);
-        if (token is null) return null;
+        if (token is null)
+        {
+            // Rastro y no evento a propósito: EnsureToken ya reportó la causa raíz con LogError.
+            // Emitir aquí otro evento por cada consulta multiplicaría un solo fallo en decenas.
+            _monitoreo.RastrearFallo("sicas.readdata", $"Sin token: no se consultó {solicitud.KeyCode}",
+                ("keycode", solicitud.KeyCode), ("pagina", solicitud.Page.ToString()));
+            return null;
+        }
 
         var req = new RestRequest("Report/ReadData", Method.Post);
         req.AddHeader("Authorization", token);
@@ -120,6 +143,17 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         if (!resp.IsSuccessStatusCode || resp.Content is null)
         {
             _log.LogWarning("ReadData {KeyCode} falló: {Status}", solicitud.KeyCode, resp.StatusCode);
+
+            // Éste es el fallo silencioso más peligroso del integrador: los clientes de dominio
+            // convierten este null en lista vacía (`resp ?? []`), el barrido lo lee como "no hay
+            // registros", corta el recorrido de páginas y se declara exitoso. Sin este reporte,
+            // "SICAS está caído" y "hoy no hubo pólizas" son indistinguibles.
+            _monitoreo.ReportarFalloSilencioso("sicas.readdata",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al consultar {solicitud.KeyCode}",
+                "consulta-descartada-se-lee-como-sin-registros",
+                ("keycode", solicitud.KeyCode),
+                ("status", ((int)resp.StatusCode).ToString()),
+                ("pagina", solicitud.Page.ToString()));
             return null;
         }
 
@@ -143,11 +177,24 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
                 else
                 {
                     _log.LogWarning(ex, "JSON inválido en ReadData {KeyCode}", solicitud.KeyCode);
+                    // El JSON malformado de SICAS se repara hasta 5 veces; llegar aquí significa
+                    // que la reparación no alcanzó y ese registro se pierde en silencio.
+                    _monitoreo.Capturar(ex, "sicas.readdata",
+                        ("keycode", solicitud.KeyCode),
+                        ("pagina", solicitud.Page.ToString()),
+                        ("consecuencia", "respuesta-descartada-json-irreparable"));
                     return null;
                 }
             }
         }
 
+        // Se agotaron los 5 intentos de reparación sin conseguir un JSON válido. Mismo efecto que
+        // arriba: el llamador lo verá como "sin registros".
+        _monitoreo.ReportarFalloSilencioso("sicas.readdata",
+            $"JSON de {solicitud.KeyCode} sigue siendo inválido tras {maxReintentos} reparaciones",
+            "consulta-descartada-se-lee-como-sin-registros",
+            ("keycode", solicitud.KeyCode),
+            ("pagina", solicitud.Page.ToString()));
         return null;
     }
 
@@ -158,20 +205,105 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     /// </summary>
     private async Task<RestResponse> EjecutarConReintentos(RestRequest req, CancellationToken ct)
     {
-        const int maxIntentos = 3;
+        const int maxIntentos = 5;
         RestResponse resp;
         int intento = 1;
         while (true)
         {
-            resp = await _http.ExecuteAsync(req, ct);
-            if (resp.IsSuccessStatusCode || resp.StatusCode != 0 || intento >= maxIntentos)
+            try
+            {
+                resp = await _http.ExecuteAsync(req, ct);
+            }
+            catch (Exception ex) when (intento < maxIntentos
+                                       && !ct.IsCancellationRequested
+                                       && EsFalloDeRed(ex))
+            {
+                // La conexión se cortó ANTES de que hubiera una respuesta que inspeccionar, así que
+                // este caso no pasa por EsTransitorio: aquí no hay RestResponse, hay excepción.
+                // Ocurrió el 07/10/2026 con un SocketException 10054 ("conexión forzada por el host
+                // remoto") en mitad de la reconciliación; sin este catch, ese siniestro se queda sin
+                // revisar hasta el día siguiente aunque el corte durara un segundo.
+                TimeSpan esperaRed = TimeSpan.FromSeconds(Math.Pow(2, intento));
+
+                _log.LogWarning(ex, "Se cortó la conexión con SICAS (intento {Intento}/{Max}); se reintenta en {Segundos}s",
+                    intento, maxIntentos, esperaRed.TotalSeconds);
+
+                await Task.Delay(esperaRed, ct);
+                intento++;
+                continue;
+            }
+
+            if (resp.IsSuccessStatusCode || intento >= maxIntentos || !EsTransitorio(resp))
                 return resp;
 
-            _log.LogDebug("Fallo de conexión con SICAS (intento {Intento}/{Max}), reintentando en {Segundos}s",
-                intento, maxIntentos, intento * 2);
-            await Task.Delay(TimeSpan.FromSeconds(intento * 2), ct);
+            TimeSpan espera = EsperaSugerida(resp) ?? TimeSpan.FromSeconds(Math.Pow(2, intento));
+
+            _log.LogWarning("SICAS respondió {Status} (intento {Intento}/{Max}); se reintenta en {Segundos}s",
+                resp.StatusCode == 0 ? "sin conexión" : resp.StatusCode.ToString(),
+                intento, maxIntentos, espera.TotalSeconds);
+
+            await Task.Delay(espera, ct);
             intento++;
         }
+    }
+
+    /// <summary>
+    /// Distingue el fallo que vale la pena reintentar del que no.
+    ///
+    /// Antes solo se reintentaba con <c>StatusCode == 0</c>, es decir cuando ni siquiera hubo
+    /// respuesta. Un 429 trae codigo valido, asi que salia al primer intento y la consulta se
+    /// descartaba: aguas arriba eso se leia como "este siniestro no existe en SICAS" -un aviso
+    /// rutinario- y el folio se quedaba sin sincronizar sin que nadie lo notara. Cuanto mas rapido
+    /// procesa el barrido, mas folios se pierden asi.
+    ///
+    /// No se reintenta un 401/403/404: ahi la respuesta no va a cambiar por insistir.
+    /// </summary>
+    /// <summary>
+    /// Caídas de red que merecen otro intento: la conexión se perdió, se agotó el tiempo o el TLS
+    /// se cortó a media lectura. Son fallos del transporte, no del contenido de la petición, así
+    /// que repetirla tiene sentido.
+    ///
+    /// Un <c>TaskCanceledException</c> aquí es el timeout del propio HttpClient; cuando viene del
+    /// apagado del servicio no llega a este punto, porque quien llama ya descartó ese caso mirando
+    /// el CancellationToken.
+    /// </summary>
+    private static bool EsFalloDeRed(Exception ex) =>
+        ex is HttpRequestException
+           or IOException
+           or System.Net.Sockets.SocketException
+           or TaskCanceledException
+        || ex.InnerException is not null && EsFalloDeRed(ex.InnerException);
+
+    private static bool EsTransitorio(RestResponse resp) =>
+        resp.StatusCode == 0                                  // no hubo respuesta
+        || resp.StatusCode == HttpStatusCode.TooManyRequests   // 429, el limite de tasa de SICAS
+        || resp.StatusCode == HttpStatusCode.RequestTimeout    // 408
+        || (int)resp.StatusCode is 502 or 503 or 504;          // caidas momentaneas del gateway
+
+    /// <summary>
+    /// Respeta el <c>Retry-After</c> cuando SICAS lo manda, en segundos o como fecha HTTP. Devuelve
+    /// null si no viene o no es interpretable, para caer al respaldo exponencial. Se acota a 60 s:
+    /// una espera mayor bloquearia el barrido mas de lo que conviene.
+    /// </summary>
+    private static TimeSpan? EsperaSugerida(RestResponse resp)
+    {
+        string? valor = resp.Headers?
+            .FirstOrDefault(h => string.Equals(h.Name, "Retry-After", StringComparison.OrdinalIgnoreCase))?
+            .Value?.ToString();
+
+        if (string.IsNullOrWhiteSpace(valor)) return null;
+
+        if (int.TryParse(valor, NumberStyles.Integer, CultureInfo.InvariantCulture, out int segundos))
+            return TimeSpan.FromSeconds(Math.Clamp(segundos, 1, 60));
+
+        if (DateTimeOffset.TryParse(valor, CultureInfo.InvariantCulture,
+                                    DateTimeStyles.AdjustToUniversal, out var cuando))
+        {
+            double faltan = (cuando - DateTimeOffset.UtcNow).TotalSeconds;
+            if (faltan > 0) return TimeSpan.FromSeconds(Math.Clamp(faltan, 1, 60));
+        }
+
+        return null;
     }
 
     private static List<T>? ExtraerFilas<T>(string json) where T : class
@@ -195,7 +327,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     public async Task<List<ArchivoSICAS>> BuscarArchivosDigitales(string identity, long valuePK, CancellationToken ct = default)
     {
         string? token = await EnsureToken(ct);
-        if (token is null) return [];
+        if (token is null)
+        {
+            // Rastro, no evento: la causa raíz ya la reportó EnsureToken (ver ReadData).
+            _monitoreo.RastrearFallo("sicas.getfiles", "Sin token: no se listaron documentos",
+                ("identity", identity), ("valuepk", valuePK.ToString()));
+            return [];
+        }
 
         // /DigitalCenter/GetFiles con TypeReadBasic=true: lectura general del Centro Digital,
         // sin depender de la configuración especial por agente/corredor que usa GetFilesAdv
@@ -218,6 +356,15 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         {
             _log.LogWarning("GetFiles identity={Identity} valuePK={PK} falló: {Status}",
                 identity, valuePK, resp.StatusCode);
+
+            // Lista vacía = "esta póliza/siniestro no tiene documentos". El registro se guarda
+            // igual y nadie nota que sus documentos nunca se subieron.
+            _monitoreo.ReportarFalloSilencioso("sicas.getfiles",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al listar documentos",
+                "documentos-no-listados-se-lee-como-sin-documentos",
+                ("identity", identity),
+                ("valuepk", valuePK.ToString()),
+                ("status", ((int)resp.StatusCode).ToString()));
             return [];
         }
 
@@ -237,6 +384,11 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
         catch (Exception ex)
         {
+            _monitoreo.Capturar(ex, "sicas.getfiles",
+                ("identity", identity),
+                ("valuepk", valuePK.ToString()),
+                ("consecuencia", "documentos-no-listados"));
+
             _log.LogWarning(ex, "Error parseando GetFiles");
             return [];
         }
@@ -252,6 +404,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             if (!resp.IsSuccessStatusCode)
             {
                 _log.LogWarning("DownloadFile {Url} → {Status}", fileUrl, resp.StatusCode);
+
+                // El llamador trata el null como "documento no disponible" y sigue con el
+                // siguiente: la póliza queda guardada y sin ese documento, sin ninguna señal.
+                _monitoreo.ReportarFalloSilencioso("sicas.descargar-archivo",
+                    $"La descarga devolvió {(int)resp.StatusCode} ({resp.StatusCode})",
+                    "documento-no-descargado",
+                    ("archivo_url", fileUrl),
+                    ("status", ((int)resp.StatusCode).ToString()));
                 return null;
             }
 
@@ -259,6 +419,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
         catch (Exception ex)
         {
+            // Se conserva el retorno null (el llamador lo trata como "documento no disponible" y
+            // sigue con el siguiente), pero se reporta: un documento que nunca llega es la falla
+            // más difícil de notar, porque la póliza/siniestro sí queda guardado.
+            _monitoreo.Capturar(ex, "sicas.descargar-archivo",
+                ("archivo_url", fileUrl),
+                ("consecuencia", "documento-no-descargado"));
+
             _log.LogError(ex, "Error descargando archivo {Url}", fileUrl);
             return null;
         }
