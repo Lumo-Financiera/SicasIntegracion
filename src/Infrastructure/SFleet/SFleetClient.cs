@@ -46,8 +46,13 @@ public sealed class SFleetClient(
                 // Antes se devolvía null sin dejar registro: con las credenciales caídas, cada
                 // póliza salía como "serie no encontrada en SFleet" (un aviso normal) y nada
                 // indicaba que en realidad ninguna se estaba sincronizando.
-                log.LogError("No se pudo autenticar contra SFleet: {Status}", resp.StatusCode);
-                monitoreo.ReportarFalloSilencioso("sfleet.token",
+                // Warning y no Error: el ReportarFalloCritico de abajo ya emite el evento con su
+                // consecuencia; un LogError aqui generaria un segundo evento del mismo fallo.
+                log.LogWarning("No se pudo autenticar contra SFleet: {Status}", resp.StatusCode);
+                // Critico y no informativo: sin token no se sincroniza NINGUNA poliza, no es el
+                // fallo de un registro. Es el caso que estuvo semanas sin detectarse porque cada
+                // poliza salia como "serie no encontrada", que es un aviso rutinario.
+                monitoreo.ReportarFalloCritico("sfleet.token",
                     $"SFleet rechazó la autenticación con {(int)resp.StatusCode} ({resp.StatusCode})",
                     "ninguna-poliza-se-sincroniza-con-sfleet",
                     ("status", ((int)resp.StatusCode).ToString()), ("email", _opts.Email));
@@ -58,7 +63,7 @@ public sealed class SFleetClient(
 
             if (string.IsNullOrWhiteSpace(_token))
             {
-                monitoreo.ReportarFalloSilencioso("sfleet.token",
+                monitoreo.ReportarFalloCritico("sfleet.token",
                     "SFleet respondió correctamente pero sin access_token",
                     "ninguna-poliza-se-sincroniza-con-sfleet",
                     ("email", _opts.Email));

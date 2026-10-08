@@ -59,4 +59,19 @@ public interface IMonitoreoErrores
     /// dice si hay que reprocesar algo a mano.</param>
     void ReportarFalloSilencioso(string operacion, string motivo, string consecuencia,
         params (string Clave, string? Valor)[] etiquetas);
+
+    /// <summary>
+    /// Igual que <see cref="ReportarFalloSilencioso"/>, pero para lo que sí tiene que despertar a
+    /// alguien: el fallo no afecta a un registro, sino a todos.
+    ///
+    /// La diferencia no se puede deducir desde fuera —un 530 del FTP se ve igual tanto si falló un
+    /// documento como si fallaron los trescientos—, así que la declara quien conoce la
+    /// consecuencia. Los casos típicos son: ningún registro del lote se pudo sincronizar, el
+    /// servicio externo no autentica, o la vinculación entre sistemas dejó de funcionar.
+    ///
+    /// Marca el evento con <c>alerta=critica</c>, que es sobre lo que se configuran las
+    /// notificaciones por correo en Sentry.
+    /// </summary>
+    void ReportarFalloCritico(string operacion, string motivo, string consecuencia,
+        params (string Clave, string? Valor)[] etiquetas);
 }

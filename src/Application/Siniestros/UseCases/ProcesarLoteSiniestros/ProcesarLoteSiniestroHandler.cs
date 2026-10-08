@@ -23,6 +23,14 @@ public sealed class ProcesarLoteSiniestroHandler(
 {
     private readonly int _idAplicacion = opciones.Value.Siniestros;
 
+    // Contadores de la corrida. Sirven para reportar los fallos de los servicios externos UNA vez,
+    // con su conteo, en lugar de una vez por documento: con el FTP caído, el reporte individual
+    // generaba cientos de eventos idénticos por noche sobre un problema ya conocido, y esa
+    // avalancha es justo lo que acaba haciendo que nadie mire las alertas.
+    // Son campos de instancia y no estáticos porque el handler se resuelve una vez por corrida.
+    private int _documentosIntentados;
+    private int _documentosFallidos;
+
     public async Task Handle(ProcesarLoteSiniestroCommand cmd, CancellationToken ct = default)
     {
         // Ver comentario equivalente en ProcesarLoteSeguroHandler: distinguir barrido automático
@@ -107,6 +115,8 @@ public sealed class ProcesarLoteSiniestroHandler(
 
         // Ver comentario equivalente en ProcesarLoteSeguroHandler.
         monitoreo.Etiquetar("registros_encontrados", totalRegistros.ToString());
+
+        ReportarResumenDocumentos();
 
         log.LogInformation("Lote Siniestros finalizado. {Total} siniestros encontrados en el rango.", totalRegistros);
     }
@@ -255,15 +265,17 @@ public sealed class ProcesarLoteSiniestroHandler(
             if (await siniestroRepo.ExisteDocumentoAsync(siniestroId, nombreBase, ct))
                 continue;
 
+            _documentosIntentados++;
+
             var bytes = await sicasRestClient.DownloadFile(archivo.PathWWW!, ct);
             if (bytes is null || bytes.Length == 0)
             {
                 log.LogWarning("No se pudo descargar el documento {Archivo} del siniestro {NoReporte}.",
                     archivo.NombreArchivo, noReporte);
-                monitoreo.ReportarFalloSilencioso("siniestros.subir-documentos",
-                    "El documento no se pudo descargar de SICAS",
-                    "siniestro-guardado-sin-este-documento",
-                    ("folio_siniestro", noReporte), ("archivo", archivo.NombreArchivo));
+                _documentosFallidos++;
+                monitoreo.RastrearFallo("siniestros.subir-documentos",
+                    $"No se pudo descargar de SICAS el documento {archivo.NombreArchivo}",
+                    ("folio_siniestro", noReporte));
                 continue;
             }
 
@@ -272,9 +284,9 @@ public sealed class ProcesarLoteSiniestroHandler(
             {
                 log.LogWarning("No se pudo subir el documento {Archivo} del siniestro {NoReporte} al FTP.",
                     archivo.NombreArchivo, noReporte);
-                monitoreo.ReportarFalloSilencioso("siniestros.subir-documentos",
-                    "El documento no se pudo subir al FTP",
-                    "siniestro-guardado-sin-este-documento",
+                _documentosFallidos++;
+                monitoreo.RastrearFallo("siniestros.subir-documentos",
+                    $"No se pudo subir al FTP el documento {archivo.NombreArchivo}",
                     ("folio_siniestro", noReporte), ("archivo", archivo.NombreArchivo));
                 continue;
             }
@@ -285,6 +297,7 @@ public sealed class ProcesarLoteSiniestroHandler(
             {
                 // El FTP lleva caído desde agosto de 2026: sin esto, el primer documento que falla
                 // deja al siniestro sin los siguientes y, peor, aborta su procesamiento.
+                _documentosFallidos++;
                 monitoreo.Capturar(ex, "siniestros.subir-documentos",
                     ("folio_siniestro", noReporte),
                     ("archivo", archivo.NombreArchivo),
@@ -293,6 +306,37 @@ public sealed class ProcesarLoteSiniestroHandler(
                     archivo.NombreArchivo, noReporte);
             }
         }
+    }
+
+    /// <summary>
+    /// Emite UN evento con el saldo de documentos de toda la corrida, en vez de uno por documento.
+    ///
+    /// Si fallaron todos, el problema no es de un archivo sino del FTP, y entonces sí alerta: eso
+    /// significa que ningún siniestro de hoy tiene su documentación en LumoSys. Si fallaron
+    /// algunos, queda registrado para auditoría sin notificar. Y si no falló ninguno, no se emite
+    /// nada: el silencio es la señal de que todo fue bien.
+    /// </summary>
+    private void ReportarResumenDocumentos()
+    {
+        if (_documentosFallidos == 0) return;
+
+        string motivo = $"{_documentosFallidos} de {_documentosIntentados} documentos de siniestro no se pudieron almacenar";
+
+        if (_documentosFallidos == _documentosIntentados)
+            monitoreo.ReportarFalloCritico("siniestros.documentos",
+                motivo,
+                "ningun-siniestro-de-la-corrida-tiene-sus-documentos",
+                ("documentos_fallidos", _documentosFallidos.ToString()),
+                ("documentos_intentados", _documentosIntentados.ToString()));
+        else
+            monitoreo.ReportarFalloSilencioso("siniestros.documentos",
+                motivo,
+                "esos-siniestros-quedaron-sin-parte-de-su-documentacion",
+                ("documentos_fallidos", _documentosFallidos.ToString()),
+                ("documentos_intentados", _documentosIntentados.ToString()));
+
+        log.LogWarning("Documentos de la corrida: {Fallidos} de {Intentados} no se almacenaron.",
+            _documentosFallidos, _documentosIntentados);
     }
 
     private async Task ProcesarBitacoraDia(DateTime desde, DateTime hasta, CancellationToken ct)
@@ -389,7 +433,10 @@ public sealed class ProcesarLoteSiniestroHandler(
             // sería el mismo de entonces — el historial de estatus deja de crecer, sin ningún error.
             if (candidatos >= 20 && vinculados == 0)
             {
-                monitoreo.ReportarFalloSilencioso("siniestros.bitacora-fase2",
+                // Critico: con este volumen no es casualidad estadistica, es que la vinculacion
+                // por IDSiniestro se rompio otra vez. El sintoma visible seria que el historial de
+                // estatus deja de crecer, sin ningun error, que es como paso inadvertido en agosto.
+                monitoreo.ReportarFalloCritico("siniestros.bitacora-fase2",
                     $"Ninguno de los {candidatos} comentarios del rango se pudo vincular a un siniestro",
                     "historial-de-estatus-no-se-actualiza",
                     ("rango_desde", desde.ToString("dd/MM/yyyy")),

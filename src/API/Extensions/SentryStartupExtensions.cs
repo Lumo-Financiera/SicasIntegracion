@@ -1,3 +1,4 @@
+using LumoSys.Integraciones.Infrastructure.Monitoring;
 using Sentry.AspNetCore;
 using Sentry.Extensibility;
 
@@ -131,7 +132,7 @@ public static class SentryStartupExtensions
         if (ApagadoEnCurso.Activo && EsCancelacion(evento.Exception))
             return null;
 
-        return evento;
+        return ClasificadorDeEventos.Clasificar(evento);
     }
 
     private static bool EsCancelacion(Exception? ex) => ex switch

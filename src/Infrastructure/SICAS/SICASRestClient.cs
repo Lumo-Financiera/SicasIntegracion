@@ -71,9 +71,14 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             using var resp = await _authHttp.PostAsync(url, new StringContent(string.Empty), ct);
             if (!resp.IsSuccessStatusCode)
             {
-                _log.LogError("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
-                _monitoreo.RastrearFallo("sicas.token", "GetToken no respondió correctamente",
-                    ("status", resp.StatusCode.ToString()), ("usuario", _usuario));
+                // Critico: sin token no se puede hacer NINGUNA consulta a SICAS, asi que no se
+                // sincroniza ni un registro. El log baja a Warning para no emitir un segundo
+                // evento del mismo fallo a traves del puente de ILogger.
+                _log.LogWarning("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                _monitoreo.ReportarFalloCritico("sicas.token",
+                    $"SICAS no entregó token: respondió {(int)resp.StatusCode} ({resp.StatusCode})",
+                    "ningun-registro-se-sincroniza-desde-sicas",
+                    ("status", ((int)resp.StatusCode).ToString()), ("usuario", _usuario));
                 return null;
             }
 
@@ -82,8 +87,10 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
 
             if (json["Sucess"]?.ToObject<bool>() != true)
             {
-                _log.LogError("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
-                _monitoreo.RastrearFallo("sicas.token", "SICAS rechazó la autenticación",
+                _log.LogWarning("SICAS rechazó la autenticación: {Mensaje}", json["Message"]?.ToString());
+                _monitoreo.ReportarFalloCritico("sicas.token",
+                    "SICAS rechazó la autenticación",
+                    "ningun-registro-se-sincroniza-desde-sicas",
                     ("mensaje", json["Message"]?.ToString()), ("usuario", _usuario));
                 return null;
             }

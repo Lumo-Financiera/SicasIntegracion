@@ -1,3 +1,5 @@
+using LumoSys.Integraciones.Domain.Shared.Errores;
+
 namespace LumoSys.Integraciones.Domain.Siniestros.Models;
 
 /// <summary>
@@ -9,7 +11,7 @@ namespace LumoSys.Integraciones.Domain.Siniestros.Models;
 /// 5267524) y 441837 (L0000006490-0) estuvieron así semanas.
 /// </summary>
 public sealed class PolizaNoRegistradaException(string numeroPoliza)
-    : InvalidOperationException($"La Póliza '{numeroPoliza}' no se encuentra registrada en SEGUROS.")
+    : ErrorDeNegocio($"La Póliza '{numeroPoliza}' no se encuentra registrada en SEGUROS.")
 {
     public string NumeroPoliza { get; } = numeroPoliza;
 }

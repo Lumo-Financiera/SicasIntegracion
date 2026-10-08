@@ -54,18 +54,36 @@ public sealed class SentryMonitoreoErrores : IMonitoreoErrores
 
     public void ReportarFalloSilencioso(string operacion, string motivo, string consecuencia,
         params (string Clave, string? Valor)[] etiquetas) =>
-        // CaptureMessage y no CaptureException: no hay excepción que capturar, ese es justamente
-        // el problema. El mensaje lleva el punto de fallo al inicio para que Sentry agrupe todos
-        // los eventos del mismo punto en un solo issue.
+        // Warning y no Error: estos fallos afectan a un registro concreto —un documento que no
+        // subió, una serie que SFleet no tiene— y deben quedar registrados para auditoría, pero
+        // no justifican un correo. Cuando el FTP lleva semanas caído, este mismo punto se dispara
+        // cientos de veces por corrida; con nivel Error eso era una tormenta de notificaciones
+        // sobre un problema ya conocido. Lo que sí alerta va por ReportarFalloCritico.
+        Reportar(operacion, motivo, consecuencia, SentryLevel.Warning, "informativa", etiquetas);
+
+    public void ReportarFalloCritico(string operacion, string motivo, string consecuencia,
+        params (string Clave, string? Valor)[] etiquetas) =>
+        Reportar(operacion, motivo, consecuencia, SentryLevel.Fatal, "critica", etiquetas);
+
+    /// <summary>
+    /// CaptureMessage y no CaptureException: no hay excepción que capturar, ese es justamente el
+    /// problema. El mensaje lleva el punto de fallo al inicio para que Sentry agrupe todos los
+    /// eventos del mismo punto en un solo issue.
+    /// </summary>
+    private static void Reportar(string operacion, string motivo, string consecuencia,
+        SentryLevel nivel, string alerta, (string Clave, string? Valor)[] etiquetas) =>
         SentrySdk.CaptureMessage($"[{operacion}] {motivo}", scope =>
         {
             scope.SetTag("operacion", operacion);
             scope.SetTag("consecuencia", consecuencia);
+            // Sobre esta etiqueta se escriben las reglas de notificación; el clasificador de
+            // SentryStartupExtensions respeta la que venga puesta desde aquí.
+            scope.SetTag("alerta", alerta);
             // Permite filtrar en Sentry exactamente esta clase de falla: la que no produce
             // excepción, no rompe nada visible y solo se nota cuando alguien echa de menos un dato.
             scope.SetTag("fallo_silencioso", "si");
             AplicarEtiquetas(scope, etiquetas);
-        }, SentryLevel.Error);
+        }, nivel);
 
     private static void AplicarEtiquetas(Scope scope, (string Clave, string? Valor)[] etiquetas)
     {

@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using LumoSys.Integraciones.Domain.Shared.Errores;
 using LumoSys.Integraciones.Domain.Seguros.Interfaces;
 using LumoSys.Integraciones.Domain.Seguros.Models;
 using LumoSys.Integraciones.Domain.Shared.Interfaces;
@@ -264,12 +265,12 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
     private async Task<byte> ResolverAseguradoraIdAsync(string? aseguradora, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(aseguradora))
-            throw new InvalidOperationException("La Aseguradora es obligatoria.");
+            throw new ErrorDeNegocio("La Aseguradora es obligatoria.");
 
         string valor = aseguradora.ToUpper();
         byte? id = await db.Aseguradoras.Where(x => x.ASE_DESCRIPCION == valor).Select(x => (byte?)x.ASE_ID).FirstOrDefaultAsync(ct);
 
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Aseguradora '{aseguradora}' no se encuentra registrada en el catálogo ASEGURADORAS.");
     }
 
@@ -281,7 +282,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
         string valor = formaPago.Trim();
         byte? id = await db.TiposFormasPagosSeguros.Where(x => x.TFS_DESCRIPCION == valor).Select(x => (byte?)x.TFS_ID).FirstOrDefaultAsync(ct);
 
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Forma de Pago '{formaPago}' no se encuentra registrada en el catálogo TIPOS_FORMAS_PAGOS_SEGUROS.");
     }
 
@@ -346,7 +347,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
             return null;
 
         byte? id = await db.TiposAdministracionesCartera.Where(x => x.TTC_DESCRIPCION == valor).Select(x => (byte?)x.TTC_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Administración de Cartera '{valor}' no se encuentra en el catálogo TIPOS_ADMINISTRACIONES_CARTERA.");
     }
 
@@ -357,7 +358,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
 
         string texto = valor.Trim();
         byte? id = await db.TiposUsos.Where(x => x.TUS_DESCRIPCION == texto).Select(x => (byte?)x.TUS_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Uso '{valor}' no se encuentra en el catálogo TIPOS_USOS.");
     }
 
@@ -384,7 +385,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
 
         string texto = valor.Trim();
         byte? id = await db.TiposPolizas.Where(x => x.TPZ_DESCRIPCION == texto).Select(x => (byte?)x.TPZ_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Póliza '{valor}' no se encuentra en el catálogo TIPOS_POLIZAS.");
     }
 
@@ -395,7 +396,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
 
         string texto = valor.Trim();
         byte? id = await db.TiposCoberturas.Where(x => x.TCX_DESCRIPCION == texto).Select(x => (byte?)x.TCX_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Cobertura '{valor}' no se encuentra en el catálogo TIPOS_COBERTURAS.");
     }
 
@@ -406,7 +407,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
 
         string texto = valor.Trim();
         byte? id = await db.TiposGestionPagosSeguro.Where(x => x.TGS_DESCRIPCION == texto).Select(x => (byte?)x.TGS_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Gestión de Pago '{valor}' no se encuentra en el catálogo TIPOS_GESTION_PAGOS_SEGURO.");
     }
 
@@ -420,7 +421,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
         texto = texto.Trim();
 
         byte? id = await db.TiposValoresSeguro.Where(x => x.TVS_DESCRIPCION == texto).Select(x => (byte?)x.TVS_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Valor de Seguro '{valor}' no se encuentra en el catálogo TIPOS_VALORES_SEGURO.");
     }
 
@@ -435,7 +436,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
             .ToListAsync(ct);
 
         var match = usuarios.FirstOrDefault(x => x.Nombre.Contains(buscado));
-        return match?.USU_ID ?? throw new InvalidOperationException(
+        return match?.USU_ID ?? throw new ErrorDeNegocio(
             $"El Ejecutivo '{ejecutivo}' no se encontró registrado en el catálogo USUARIOS.");
     }
 
@@ -450,7 +451,7 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
         {
             "AMPARADA" or "AMPARADO" => true,
             "NO APLICA" => false,
-            _ => throw new InvalidOperationException($"El valor de cobertura '{valor}' debe ser AMPARADA, AMPARADO o NO APLICA.")
+            _ => throw new ErrorDeNegocio($"El valor de cobertura '{valor}' debe ser AMPARADA, AMPARADO o NO APLICA.")
         };
     }
 

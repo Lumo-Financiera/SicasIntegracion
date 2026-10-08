@@ -1,3 +1,4 @@
+using LumoSys.Integraciones.Domain.Shared.Errores;
 using LumoSys.Integraciones.Domain.Siniestros.Interfaces;
 using LumoSys.Integraciones.Domain.Siniestros.Models;
 using LumoSys.Integraciones.Infrastructure.Persistence.Models;
@@ -77,7 +78,7 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         using var tx = await db.Database.BeginTransactionAsync(ct);
 
         int cdeId = await ResolverCdeIdAsync(datos.NoSerie ?? string.Empty, ct)
-            ?? throw new InvalidOperationException(
+            ?? throw new ErrorDeNegocio(
                 $"La serie '{datos.NoSerie}' no está registrada como vehículo propio en COMPRAS_DETALLES.");
 
         int tsiId = await ResolverTipoSiniestroIdAsync(datos.TipoSiniestro, ct);
@@ -184,31 +185,31 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
     private async Task<int> ResolverTipoSiniestroIdAsync(string? valor, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(valor))
-            throw new InvalidOperationException("El Tipo de Siniestro es obligatorio.");
+            throw new ErrorDeNegocio("El Tipo de Siniestro es obligatorio.");
 
         string texto = valor.ToUpper();
         int? id = await db.TiposSiniestros.Where(x => x.TSI_DESCRIPCION == texto).Select(x => (int?)x.TSI_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Siniestro '{valor}' no se encuentra en el catálogo TIPOS_SINIESTROS.");
     }
 
     private async Task<byte> ResolverTipoOrigenIdAsync(CancellationToken ct)
     {
         byte? id = await db.TiposOrigenes.Where(x => x.TOR_DESCRIPCION == "SISTEMA").Select(x => (byte?)x.TOR_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException("No se encontró 'SISTEMA' en el catálogo TIPOS_ORIGENES.");
+        return id ?? throw new ErrorDeNegocio("No se encontró 'SISTEMA' en el catálogo TIPOS_ORIGENES.");
     }
 
     private async Task<int> ResolverTipoEstatusIdAsync(string? valor, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(valor))
-            throw new InvalidOperationException("El Estatus del siniestro es obligatorio.");
+            throw new ErrorDeNegocio("El Estatus del siniestro es obligatorio.");
 
         string texto = valor.ToUpper();
         int? id = await db.TiposEstatus
             .Where(x => x.TES_DESCRIPCION == texto && x.TES_TMO_ID == TMO_ID_SINIESTROS)
             .Select(x => (int?)x.TES_ID).FirstOrDefaultAsync(ct);
 
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Estatus '{valor}' no se encuentra en el catálogo TIPOS_ESTATUS (TES_TMO_ID={TMO_ID_SINIESTROS}).");
     }
 
@@ -219,7 +220,7 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         if (string.Equals(estatus, ESTATUS_SOLICITUD, StringComparison.OrdinalIgnoreCase))
         {
             if (string.IsNullOrEmpty(ejecutivo))
-                throw new InvalidOperationException("Ejecutivo requerido para estatus SOLICITUD.");
+                throw new ErrorDeNegocio("Ejecutivo requerido para estatus SOLICITUD.");
 
             string buscado = ejecutivo.Trim().ToUpper();
             var usuarios = await db.Usuarios
@@ -227,7 +228,7 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
                 .ToListAsync(ct);
 
             var match = usuarios.FirstOrDefault(x => x.Nombre.Contains(buscado));
-            return match?.USU_ID ?? throw new InvalidOperationException(
+            return match?.USU_ID ?? throw new ErrorDeNegocio(
                 $"El Ejecutivo '{ejecutivo}' no se encontró registrado en el catálogo USUARIOS.");
         }
 

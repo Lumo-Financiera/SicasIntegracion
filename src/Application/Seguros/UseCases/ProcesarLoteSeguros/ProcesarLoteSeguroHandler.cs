@@ -23,6 +23,14 @@ public sealed class ProcesarLoteSeguroHandler(
 {
     private readonly int _idAplicacion = opciones.Value.Seguros;
 
+    // Saldo de la corrida para los dos servicios externos que fallan de forma repetida. Se reporta
+    // una vez al final, con el conteo, en lugar de una vez por documento o por póliza: el reporte
+    // individual producía cientos de eventos idénticos por noche sobre problemas ya conocidos.
+    private int _documentosIntentados;
+    private int _documentosFallidos;
+    private int _sfleetIntentos;
+    private int _sfleetFallos;
+
     public async Task Handle(ProcesarLoteSeguroCommand cmd, CancellationToken ct = default)
     {
         // El disparador queda etiquetado desde el primer momento: en Sentry es la diferencia
@@ -112,6 +120,8 @@ public sealed class ProcesarLoteSeguroHandler(
         // fecha, invisible durante semanas porque un lote vacío no falla.
         monitoreo.Etiquetar("registros_encontrados", totalRegistros.ToString());
 
+        ReportarResumenExterno();
+
         log.LogInformation("Lote Seguros finalizado. {Total} pólizas encontradas en el rango.", totalRegistros);
     }
 
@@ -157,6 +167,56 @@ public sealed class ProcesarLoteSeguroHandler(
         }
 
         await ProcesarPolizaCompleta(resumen, ct);
+    }
+
+    /// <summary>
+    /// Emite el saldo de los servicios externos de toda la corrida, en vez de un evento por cada
+    /// documento y cada póliza.
+    ///
+    /// Cuando falla el 100% el problema no es de un registro sino del servicio, y entonces sí
+    /// alerta: significa que ninguna póliza de hoy llegó a SFleet, o que ningún documento se
+    /// almacenó. Un fallo parcial queda registrado sin notificar, y si no hubo fallos no se emite
+    /// nada.
+    /// </summary>
+    private void ReportarResumenExterno()
+    {
+        if (_documentosFallidos > 0)
+        {
+            string motivo = $"{_documentosFallidos} de {_documentosIntentados} documentos de póliza no se pudieron almacenar";
+
+            if (_documentosFallidos == _documentosIntentados)
+                monitoreo.ReportarFalloCritico("seguros.documentos", motivo,
+                    "ninguna-poliza-de-la-corrida-tiene-sus-documentos",
+                    ("documentos_fallidos", _documentosFallidos.ToString()),
+                    ("documentos_intentados", _documentosIntentados.ToString()));
+            else
+                monitoreo.ReportarFalloSilencioso("seguros.documentos", motivo,
+                    "esas-polizas-quedaron-sin-parte-de-su-documentacion",
+                    ("documentos_fallidos", _documentosFallidos.ToString()),
+                    ("documentos_intentados", _documentosIntentados.ToString()));
+
+            log.LogWarning("Documentos de la corrida: {Fallidos} de {Intentados} no se almacenaron.",
+                _documentosFallidos, _documentosIntentados);
+        }
+
+        if (_sfleetFallos > 0)
+        {
+            string motivo = $"{_sfleetFallos} de {_sfleetIntentos} pólizas no se pudieron sincronizar con SFleet";
+
+            if (_sfleetFallos == _sfleetIntentos)
+                monitoreo.ReportarFalloCritico("seguros.sfleet", motivo,
+                    "ninguna-poliza-de-la-corrida-llego-a-sfleet",
+                    ("sfleet_fallos", _sfleetFallos.ToString()),
+                    ("sfleet_intentos", _sfleetIntentos.ToString()));
+            else
+                monitoreo.ReportarFalloSilencioso("seguros.sfleet", motivo,
+                    "esas-polizas-viven-solo-en-lumosys",
+                    ("sfleet_fallos", _sfleetFallos.ToString()),
+                    ("sfleet_intentos", _sfleetIntentos.ToString()));
+
+            log.LogWarning("SFleet en la corrida: {Fallos} de {Intentos} pólizas no se sincronizaron.",
+                _sfleetFallos, _sfleetIntentos);
+        }
     }
 
     private async Task ProcesarPolizaCompleta(PolizaResumenSICAS resumen, CancellationToken ct)
@@ -245,20 +305,20 @@ public sealed class ProcesarLoteSeguroHandler(
             {
                 try
                 {
+                _documentosIntentados++;
+
                 var bytes = await sicasRestClient.DownloadFile(archivo.PathWWW!, ct);
                 if (bytes is null || bytes.Length == 0)
                 {
                     log.LogWarning("No se pudo descargar el documento {Archivo} de la póliza {Poliza}.",
                         archivo.NombreArchivo, resumen.Documento);
 
-                    // DownloadFile ya reportó la causa técnica; esto añade a qué póliza pertenece,
-                    // que es el dato con el que se reprocesa a mano.
-                    monitoreo.ReportarFalloSilencioso("seguros.subir-documentos",
-                        "El documento no se pudo descargar de SICAS",
-                        "poliza-guardada-sin-este-documento",
-                        ("poliza", resumen.Documento),
-                        ("serie", detalle.Serie),
-                        ("archivo", archivo.NombreArchivo));
+                    // Rastro y no evento: el saldo de toda la corrida se reporta una sola vez al
+                    // final. DownloadFile ya dejó la causa técnica registrada.
+                    _documentosFallidos++;
+                    monitoreo.RastrearFallo("seguros.subir-documentos",
+                        $"No se pudo descargar de SICAS el documento {archivo.NombreArchivo}",
+                        ("poliza", resumen.Documento), ("serie", detalle.Serie));
                     continue;
                 }
 
@@ -274,6 +334,7 @@ public sealed class ProcesarLoteSeguroHandler(
                     // El FTP lleva caído desde agosto de 2026: sin esto, el primer documento que
                     // falla deja a la póliza sin los siguientes y aborta su procesamiento, que
                     // incluye la sincronización con SFleet.
+                    _documentosFallidos++;
                     monitoreo.Capturar(ex, "seguros.subir-documentos",
                         ("poliza", resumen.Documento),
                         ("archivo", archivo.NombreArchivo),
@@ -340,7 +401,9 @@ public sealed class ProcesarLoteSeguroHandler(
             };
 
             // Se manda el id de la PÓLIZA, no el del vehículo: ese ya viaja en ClienteVehiculoId.
-            await sfleetClient.GuardarPoliza(solicitud, polizaSFleetId, ct);
+            _sfleetIntentos++;
+            int idEnSFleet = await sfleetClient.GuardarPoliza(solicitud, polizaSFleetId, ct);
+            if (idEnSFleet == 0) _sfleetFallos++;
         }
         catch (Exception ex)
         {
