@@ -213,6 +213,12 @@ public sealed class ProcesarLoteSiniestroHandler(
                 return;
             }
 
+            // El estatus y el historial, con lo que SICAS reporta AHORA. Sin esto, guardar el
+            // siniestro dejaba sus datos al día pero su estatus intacto: reprocesar un folio a mano
+            // —lo que pide operaciones cuando ve uno mal— no lo arreglaba, porque la corrección
+            // vivía solo en la Fase 3 y esa únicamente corre en el barrido diario.
+            await PonerEstatusAlDia(resultado.SiniestroId!.Value, siniestro, ct);
+
             monitoreo.Rastrear("siniestros.guardado", $"Siniestro {siniestro.NumReporte} guardado",
                 ("siniestro_id", resultado.SiniestroId?.ToString()),
                 ("archivos", archivos.Count.ToString()));
@@ -445,6 +451,43 @@ public sealed class ProcesarLoteSiniestroHandler(
             // Un solo reintento: si la póliza tampoco está en SICAS, la excepción sube y el catch
             // general de ProcesarSiniestroCompleto la reporta como cualquier otro fallo.
             return await guardarHandler.Handle(cmd, ct);
+        }
+    }
+
+    /// <summary>
+    /// Deja el historial y el estatus visible de UN siniestro igual a lo que SICAS reporta.
+    ///
+    /// Se llama cada vez que el ETL toca un siniestro, venga del barrido por fechas o de un
+    /// reproceso manual por folio, para que el resultado sea el mismo por cualquiera de las dos
+    /// vías. Antes, reprocesar un folio solo refrescaba sus datos —póliza, montos, fechas— y
+    /// dejaba el estatus como estuviera: 20220000209858 seguía EN TRAMITE después de procesarlo,
+    /// con SICAS diciendo FECHA DE RESOLUCION.
+    ///
+    /// No lanza: un siniestro cuyo historial no se pueda traer igual quedó guardado, y que falle
+    /// esto no puede tumbar el barrido.
+    /// </summary>
+    private async Task PonerEstatusAlDia(int siniestroId, SiniestroResumenSICAS siniestro, CancellationToken ct)
+    {
+        try
+        {
+            if (siniestro.IDSiniestro.HasValue)
+                await SincronizarBitacora(siniestroId, siniestro.IDSiniestro.Value,
+                    siniestro.NumReporte!, siniestro.Status_Txt, siniestro.EjecutNombre, ct);
+
+            string? oficial = MapearEstatusSicas(siniestro.Status_Txt);
+            if (oficial is null) return;
+
+            if (await siniestroRepo.AlinearEstatusEfectivoAsync(siniestroId, oficial, ct))
+                log.LogInformation("Siniestro {NoReporte}: estatus alineado a {Estatus} según SICAS.",
+                    siniestro.NumReporte, oficial);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            monitoreo.Capturar(ex, "siniestros.estatus-al-dia",
+                ("folio_siniestro", siniestro.NumReporte),
+                ("consecuencia", "siniestro-guardado-con-estatus-sin-actualizar"));
+            log.LogError(ex, "Error poniendo al día el estatus de {NoReporte}; el siniestro sí quedó guardado.",
+                siniestro.NumReporte);
         }
     }
 

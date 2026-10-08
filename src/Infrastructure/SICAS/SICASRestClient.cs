@@ -203,7 +203,28 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         int intento = 1;
         while (true)
         {
-            resp = await _http.ExecuteAsync(req, ct);
+            try
+            {
+                resp = await _http.ExecuteAsync(req, ct);
+            }
+            catch (Exception ex) when (intento < maxIntentos
+                                       && !ct.IsCancellationRequested
+                                       && EsFalloDeRed(ex))
+            {
+                // La conexión se cortó ANTES de que hubiera una respuesta que inspeccionar, así que
+                // este caso no pasa por EsTransitorio: aquí no hay RestResponse, hay excepción.
+                // Ocurrió el 07/10/2026 con un SocketException 10054 ("conexión forzada por el host
+                // remoto") en mitad de la reconciliación; sin este catch, ese siniestro se queda sin
+                // revisar hasta el día siguiente aunque el corte durara un segundo.
+                TimeSpan esperaRed = TimeSpan.FromSeconds(Math.Pow(2, intento));
+
+                _log.LogWarning(ex, "Se cortó la conexión con SICAS (intento {Intento}/{Max}); se reintenta en {Segundos}s",
+                    intento, maxIntentos, esperaRed.TotalSeconds);
+
+                await Task.Delay(esperaRed, ct);
+                intento++;
+                continue;
+            }
 
             if (resp.IsSuccessStatusCode || intento >= maxIntentos || !EsTransitorio(resp))
                 return resp;
@@ -230,6 +251,22 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     ///
     /// No se reintenta un 401/403/404: ahi la respuesta no va a cambiar por insistir.
     /// </summary>
+    /// <summary>
+    /// Caídas de red que merecen otro intento: la conexión se perdió, se agotó el tiempo o el TLS
+    /// se cortó a media lectura. Son fallos del transporte, no del contenido de la petición, así
+    /// que repetirla tiene sentido.
+    ///
+    /// Un <c>TaskCanceledException</c> aquí es el timeout del propio HttpClient; cuando viene del
+    /// apagado del servicio no llega a este punto, porque quien llama ya descartó ese caso mirando
+    /// el CancellationToken.
+    /// </summary>
+    private static bool EsFalloDeRed(Exception ex) =>
+        ex is HttpRequestException
+           or IOException
+           or System.Net.Sockets.SocketException
+           or TaskCanceledException
+        || ex.InnerException is not null && EsFalloDeRed(ex.InnerException);
+
     private static bool EsTransitorio(RestResponse resp) =>
         resp.StatusCode == 0                                  // no hubo respuesta
         || resp.StatusCode == HttpStatusCode.TooManyRequests   // 429, el limite de tasa de SICAS
