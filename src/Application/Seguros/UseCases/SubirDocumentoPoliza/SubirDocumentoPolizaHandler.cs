@@ -36,7 +36,11 @@ public sealed class SubirDocumentoPolizaHandler(
         bool subido = await documentService.SubirDocumentoPoliza($"{archivoId}{extension}", cmd.Bytes, ct);
         if (!subido)
         {
+            // El ARC_ID tiene que existir antes de subir (el nombre remoto ES el ARC_ID), así que
+            // si el FTP falla hay que deshacer el registro: de lo contrario ARCHIVOS_REPOSITORIOS
+            // acumula filas sin archivo físico y sin vínculo, invisibles para cualquier reproceso.
             log.LogError("Error subiendo al FTP el documento {Archivo} (ARC_ID={ArcId})", cmd.NombreArchivo, archivoId);
+            await repo.EliminarArchivoAsync(archivoId, ct);
             return 0;
         }
 

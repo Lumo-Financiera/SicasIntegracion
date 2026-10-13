@@ -26,6 +26,23 @@ public interface ISiniestroRepository
     /// <summary>Siniestros que LumoSys muestra abiertos, para la fase de reconciliación.</summary>
     Task<List<SiniestroAbierto>> ObtenerSiniestrosAbiertosAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Siniestros a los que hay que volver a preguntarles si SICAS publicó documentos nuevos.
+    ///
+    /// Es la UNIÓN de dos conjuntos, y los dos hacen falta:
+    /// los que siguen abiertos (sin importar su antigüedad) y los registrados en los últimos
+    /// <paramref name="diasAtras"/> días **aunque ya estén cerrados**. Lo segundo no es un extra:
+    /// medido el 13/10/2026, de los 225 siniestros con documentos pendientes en SICAS, 159 estaban
+    /// cerrados — el ajustador sube el expediente después de que se resuelve el caso.
+    /// Solo devuelve los que tienen SIN_FOLIO_SICAS, que es el IDSiniestro con el que se consulta
+    /// el Centro Digital.
+    /// </summary>
+    /// <param name="completa">true devuelve TODOS los siniestros vinculados a SICAS, ignorando la
+    /// ventana y el estatus: es la puesta al día que corre al desplegar. false aplica el filtro
+    /// incremental (sin documentos ∪ abiertos ∪ recientes), que se reduce solo conforme se migran.</param>
+    Task<List<SiniestroParaDocumentos>> ObtenerParaRevisionDocumentalAsync(
+        int diasAtras, bool completa, CancellationToken ct = default);
+
     Task<bool> ExisteDocumentoAsync(int siniestroId, string nombreBase, CancellationToken ct = default);
     Task RegistrarDocumentoAsync(int siniestroId, string nombreArchivo, CancellationToken ct = default);
     Task<int?> BuscarIdPorReporte(string noReporte, CancellationToken ct = default);

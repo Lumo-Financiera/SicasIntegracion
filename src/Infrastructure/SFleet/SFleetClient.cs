@@ -30,6 +30,11 @@ public sealed class SFleetClient(
     private readonly SFleetOptions _opts = opts.Value;
     private string? _token;
 
+    /// <summary>Catálogo de aseguradoras de SFleet, cacheado por nombre en mayúsculas. El cliente es
+    /// scoped (una instancia por lote), así que esto evita repetir GET /insurers por cada póliza
+    /// sin arriesgarse a servir un catálogo rancio entre corridas.</summary>
+    private readonly Dictionary<string, int> _aseguradoras = new(StringComparer.OrdinalIgnoreCase);
+
     private async Task<string?> ObtenerToken(CancellationToken ct)
     {
         if (_token is not null) return _token;
@@ -142,7 +147,31 @@ public sealed class SFleetClient(
                 return null;
             }
 
-            return JArray.Parse(resp.Content).FirstOrDefault()?["id"]?.ToObject<int>();
+            var resultados = JArray.Parse(resp.Content);
+            if (resultados.Count == 0)
+                return null;
+
+            // Guarda del PATCH: `q=` es una búsqueda difusa y el primer resultado no tiene por qué
+            // ser esta póliza. Devolver ese id convertiría el PATCH de GuardarPoliza en una
+            // sobrescritura de la póliza de otro cliente. Solo se acepta la coincidencia exacta.
+            var exacta = resultados.FirstOrDefault(x =>
+                string.Equals(
+                    x["police"]?.ToString()?.Trim(),
+                    numeroPoliza.Trim(),
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (exacta is null)
+            {
+                monitoreo.ReportarFalloSilencioso("sfleet.buscar-poliza",
+                    $"SFleet devolvió {resultados.Count} resultado(s) pero ninguno con police exactamente igual",
+                    "se-dara-de-alta-en-vez-de-actualizar-para-no-sobrescribir-una-poliza-ajena",
+                    ("poliza", numeroPoliza),
+                    ("resultados", resultados.Count.ToString()),
+                    ("primer_police", resultados[0]["police"]?.ToString()));
+                return null;
+            }
+
+            return exacta["id"]?.ToObject<int>();
         }
         catch (Exception ex)
         {
@@ -176,21 +205,61 @@ public sealed class SFleetClient(
             var metodo = esEdicion ? Method.Patch : Method.Post;
             var ruta   = esEdicion ? $"request_insurances/{polizaSFleetId!.Value}" : "request_insurances";
 
+            int insurerId = await ResolverAseguradoraId(solicitud.Aseguradora, token, ct);
+
             var req = new RestRequest(ruta, metodo);
             req.AddHeader("Authorization", $"Bearer {token}");
+
+            // El cuerpo reproduce el contrato completo del ETL legacy. Mandar solo 8 de los ~40
+            // campos hacía que SFleet contestara 422 a TODA póliza: ninguna se daba de alta y,
+            // por tanto, ningún documento tenía a qué adjuntarse. Los campos que SICAS no provee
+            // van en 0/vacío igual que en el legacy, para no alterar la forma del payload.
             req.AddJsonBody(new
             {
                 request_insurance = new
                 {
-                    police          = solicitud.NumeroPoliza,
-                    net_premium     = solicitud.PrimaNeta,
-                    coverage        = solicitud.Cobertura,
-                    date_start      = solicitud.FechaInicio.ToString("yyyy-MM-dd"),
-                    date_end        = solicitud.FechaVencimiento.ToString("yyyy-MM-dd"),
-                    client_car_id   = solicitud.ClienteVehiculoId,
-                    beneficiary     = solicitud.Beneficiario,
-                    broker          = solicitud.Broker,
-                    way_to_pay      = solicitud.FormaPago
+                    police                = solicitud.NumeroPoliza,
+                    portfolio_management  = solicitud.AdministracionCartera,
+                    net_premium           = solicitud.PrimaNeta,
+                    coverage              = solicitud.Cobertura,
+                    incident_executive    = solicitud.Ejecutivo,
+                    date_start            = solicitud.FechaInicio.ToString("yyyy-MM-dd"),
+                    date_end              = solicitud.FechaVencimiento.ToString("yyyy-MM-dd"),
+                    subsection            = (solicitud.Inciso ?? 1).ToString(),
+                    payment_management    = solicitud.GestionPago,
+                    beneficiary           = solicitud.Beneficiario,
+                    amount                = solicitud.PrimaTotal,
+                    executive             = solicitud.Ejecutivo,
+                    contract_number       = 0,
+                    contractor            = string.Empty,
+                    asset_description     = solicitud.Adaptacion,
+                    adaptation_description = solicitud.Adaptacion,
+                    invoice_value         = solicitud.ValorFactura ?? 0,
+                    value_adaptation      = solicitud.ValorAdaptacion ?? 0,
+                    passengers            = solicitud.Pasajeros,
+                    broker                = solicitud.Broker,
+                    type_policy           = solicitud.TipoPoliza,
+                    issuance_date         = DateTime.Now.ToString("yyyy-MM-dd"),
+                    deductible_payment    = 0,
+                    days                  = solicitud.Dias,
+                    preferent_beneficiary = solicitud.BeneficiarioPreferente,
+                    use                   = solicitud.TipoUso,
+                    way_to_pay            = solicitud.FormaPago,
+                    udi                   = 0,
+                    surcharges            = solicitud.Recargos ?? 0,
+                    rights                = solicitud.Derechos ?? 0,
+                    iva                   = solicitud.IVA ?? 0,
+                    total                 = solicitud.PrimaTotal,
+                    first_receipt         = (solicitud.PrimerRecibo ?? 0).ToString(),
+                    subsequent            = (solicitud.Subsecuente ?? 0).ToString(),
+                    total_receipts        = 0,
+                    amount_udis           = 0,
+                    rc_aditionals         = solicitud.ResponsabilidadCivilAdicionales,
+                    comments              = string.Empty,
+                    catalogue_id          = 15,
+                    insurer_id            = insurerId,
+                    client_car_id         = solicitud.ClienteVehiculoId,
+                    client_car_file_id    = 1
                 }
             });
 
@@ -221,6 +290,62 @@ public sealed class SFleetClient(
                 ("operacion_sfleet", esEdicion ? "edicion" : "alta"),
                 ("consecuencia", "guardada-en-lumosys-sin-sincronizar-sfleet"));
             log.LogError(ex, "Error guardando la póliza {Poliza} en SFleet", solicitud.NumeroPoliza);
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Traduce el nombre de la aseguradora de SICAS al id que usa SFleet (GET /insurers), igual
+    /// que hacía <c>ObtenerAseguradoraSFleet</c> en el ETL legacy. Devuelve 0 si no se puede
+    /// resolver, que es lo que el legacy mandaba también; eso no se trata como error porque el
+    /// alta puede seguir siendo válida, pero sí se reporta para poder detectar un catálogo
+    /// desalineado entre los dos sistemas.
+    /// </summary>
+    private async Task<int> ResolverAseguradoraId(string? aseguradora, string token, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(aseguradora))
+            return 0;
+
+        string clave = aseguradora.Trim().ToUpperInvariant();
+        if (_aseguradoras.TryGetValue(clave, out int cacheado))
+            return cacheado;
+
+        try
+        {
+            var req = new RestRequest("insurers");
+            req.AddHeader("Authorization", $"Bearer {token}");
+
+            var resp = await _http.ExecuteGetAsync(req, ct);
+            if (!resp.IsSuccessStatusCode || resp.Content is null)
+            {
+                monitoreo.ReportarFalloSilencioso("sfleet.buscar-aseguradora",
+                    $"SFleet respondió {(int)resp.StatusCode} ({resp.StatusCode}) al listar aseguradoras",
+                    "poliza-se-envia-con-insurer_id-0",
+                    ("aseguradora", aseguradora), ("status", ((int)resp.StatusCode).ToString()));
+                return 0;
+            }
+
+            int id = JArray.Parse(resp.Content)
+                .FirstOrDefault(x => string.Equals(
+                    x["name"]?.ToString()?.Trim(), clave, StringComparison.OrdinalIgnoreCase))
+                ?["id"]?.ToObject<int>() ?? 0;
+
+            if (id == 0)
+            {
+                monitoreo.ReportarFalloSilencioso("sfleet.buscar-aseguradora",
+                    $"La aseguradora '{aseguradora}' no está en el catálogo de SFleet",
+                    "poliza-se-envia-con-insurer_id-0",
+                    ("aseguradora", aseguradora));
+            }
+
+            _aseguradoras[clave] = id;
+            return id;
+        }
+        catch (Exception ex)
+        {
+            monitoreo.Capturar(ex, "sfleet.buscar-aseguradora",
+                ("aseguradora", aseguradora), ("consecuencia", "poliza-se-envia-con-insurer_id-0"));
+            log.LogError(ex, "Error consultando el catálogo de aseguradoras de SFleet");
             return 0;
         }
     }

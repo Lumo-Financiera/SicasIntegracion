@@ -457,21 +457,48 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
 
     // ─── Documentos ──────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// ¿Esta serie ya tiene registrado este documento de póliza?
+    ///
+    /// La versión anterior recibía <paramref name="serie"/> y no la usaba: preguntaba si
+    /// ALGUNA unidad del sistema tenía un documento de tipo 4 cuyo nombre CONTUVIERA el
+    /// texto buscado. Con los nombres genéricos que manda SICAS ("POLIZA.pdf", "1.pdf"),
+    /// el primer documento cargado para cualquier vehículo hacía que todos los demás se
+    /// descartaran como "ya existe" y nunca se subieran. Ahora se acota al vehículo real
+    /// (DUN_CDE_ID → COMPRAS_DETALLES.CDE_NO_SERIE) y se compara por igualdad.
+    /// </summary>
     public async Task<bool> ExisteDocumentoAsync(string serie, string nombreArchivo, CancellationToken ct = default)
     {
-        return await db.DocumentosUnidades
-            .Join(db.ArchivosRepositorios,
-                du => du.DUN_ARC_ID,
-                ar => ar.ARC_ID,
-                (du, ar) => new { du, ar })
-            .AnyAsync(x =>
-                x.du.DUN_TDW_ID == 4 &&
-                x.ar.ARC_NOMBRE_ARCHIVO.Contains(nombreArchivo), ct);
+        if (string.IsNullOrWhiteSpace(serie) || string.IsNullOrWhiteSpace(nombreArchivo))
+            return false;
+
+        return await (
+            from du in db.DocumentosUnidades
+            join ar in db.ArchivosRepositorios on du.DUN_ARC_ID equals ar.ARC_ID
+            join cd in db.ComprasDetalles on du.DUN_CDE_ID equals cd.CDE_ID
+            where du.DUN_TDW_ID == 4
+                  && cd.CDE_NO_SERIE == serie
+                  && ar.ARC_NOMBRE_ARCHIVO == nombreArchivo
+            select du.DUN_ID
+        ).AnyAsync(ct);
     }
 
     public async Task<int> RegistrarArchivoAsync(string nombreArchivo, long tamanoBytes, CancellationToken ct = default)
     {
         int arcId = await ObtenerSecuenciaAsync("ARC", ct);
+
+        // ARC_TMM_ID queda fijo en 2 (PDF) porque el catálogo TIPOS_MULTIMEDIA no está modelado
+        // en este proyecto y no hay forma de resolver el id real de otras extensiones sin
+        // inventarlo. SICAS entrega casi siempre PDF, pero cuando no lo hace el archivo queda
+        // etiquetado mal, así que al menos se avisa en vez de pasar en silencio.
+        string extension = Path.GetExtension(nombreArchivo);
+        if (!string.Equals(extension, ".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            monitoreo.ReportarFalloSilencioso("seguros.registrar-archivo",
+                $"El documento no es PDF ({extension}) y se registra con ARC_TMM_ID=2 de todos modos",
+                "archivo-registrado-con-tipo-multimedia-incorrecto",
+                ("archivo", nombreArchivo), ("extension", extension), ("archivo_id", arcId.ToString()));
+        }
 
         var nuevoArchivo = new ArchivosRepositoriosModel
         {
@@ -487,6 +514,25 @@ public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monito
         db.ArchivosRepositorios.Add(nuevoArchivo);
         await db.SaveChangesAsync(ct);
         return nuevoArchivo.ARC_ID;
+    }
+
+    /// <summary>
+    /// Borra la fila de ARCHIVOS_REPOSITORIOS cuando la subida al FTP falló.
+    ///
+    /// El ARC_ID tiene que existir antes de subir, porque el nombre del archivo en el FTP ES el
+    /// ARC_ID. Si la subida falla y la fila se queda, el repositorio acumula registros que
+    /// apuntan a un archivo que no existe; peor aún, el reintento del día siguiente los seguiría
+    /// ignorando porque nunca se vincularon. Se deshace el registro para que el reproceso parta
+    /// de cero. El folio de la secuencia sí se consume — eso no es reversible ni importa.
+    /// </summary>
+    public async Task EliminarArchivoAsync(int archivoId, CancellationToken ct = default)
+    {
+        var archivo = await db.ArchivosRepositorios.FirstOrDefaultAsync(x => x.ARC_ID == archivoId, ct);
+        if (archivo is null)
+            return;
+
+        db.ArchivosRepositorios.Remove(archivo);
+        await db.SaveChangesAsync(ct);
     }
 
     public async Task VincularDocumentoUnidadAsync(string serie, int archivoId, CancellationToken ct = default)

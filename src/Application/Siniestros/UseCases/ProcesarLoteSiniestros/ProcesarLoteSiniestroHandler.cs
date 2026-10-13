@@ -31,6 +31,28 @@ public sealed class ProcesarLoteSiniestroHandler(
     private int _documentosIntentados;
     private int _documentosFallidos;
 
+    /// <summary>
+    /// Cortacircuitos del almacenamiento de documentos. Cuenta fallos de FTP seguidos dentro de la
+    /// misma corrida; al llegar a <see cref="MaxFallosFtpSeguidos"/> se dejan de intentar documentos
+    /// hasta la siguiente corrida.
+    ///
+    /// Hace falta desde que la Fase 3 revisa el Centro Digital de los 227 siniestros abiertos cada
+    /// día: con el FTP caído, sin esto se descargarían de SICAS cientos de MB diarios —el PDF de
+    /// fotografías de un solo siniestro pesa 14.7 MB— para tirarlos justo en el último paso. El
+    /// saldo de la corrida se sigue reportando igual; lo que se evita es el gasto inútil.
+    /// </summary>
+    private int _fallosFtpSeguidos;
+    private bool _almacenamientoDescartado;
+    private const int MaxFallosFtpSeguidos = 5;
+
+    /// <summary>
+    /// Cuántos días hacia atrás revisa la Fase 4 el Centro Digital, además de los siniestros que
+    /// sigan abiertos. 90 días cubre con holgura lo que tarda un ajustador en subir el expediente
+    /// —el caso medido se cerró antes de que llegaran sus archivos— y acota el recorrido: al
+    /// 13/10/2026 son 677 siniestros de los 1,408 con folio SICAS.
+    /// </summary>
+    private const int DiasRevisionDocumental = 90;
+
     public async Task Handle(ProcesarLoteSiniestroCommand cmd, CancellationToken ct = default)
     {
         // Ver comentario equivalente en ProcesarLoteSeguroHandler: distinguir barrido automático
@@ -41,6 +63,14 @@ public sealed class ProcesarLoteSiniestroHandler(
         {
             monitoreo.Etiquetar("disparador", "manual-folio");
             await ProcesarPorReporte(cmd.FolioSiniestro, ct);
+            return;
+        }
+
+        if (cmd.SoloDocumentos)
+        {
+            monitoreo.Etiquetar("disparador", cmd.RevisionCompleta ? "documental-completa" : "documental-incremental");
+            await RevisarDocumentosTardios(cmd.RevisionCompleta, ct);
+            ReportarResumenDocumentos();
             return;
         }
 
@@ -108,6 +138,13 @@ public sealed class ProcesarLoteSiniestroHandler(
         await ProcesarBitacoraDia(desde, hasta, ct);
 
         // Fase 3: poner al día lo que el barrido por fechas no puede ver (ver ReconciliarAbiertos).
+        // Solo en el barrido diario: recorre TODO el universo vigente, no el rango pedido, así que
+        // repetirla en cada reproceso manual sería gasto puro.
+        //
+        // La Fase 4 (documentos) NO se invoca aquí a propósito: la ejecuta
+        // SincronizacionDocumentalBackgroundService, que la corre completa al arrancar y cada
+        // noche. Llamarla también desde aquí significaría recorrer SICAS dos veces por noche —780
+        // consultas en modo incremental más 1,408 en el completo— para el mismo resultado.
         if (reconciliar)
             await ReconciliarAbiertos(ct);
         else
@@ -254,9 +291,15 @@ public sealed class ProcesarLoteSiniestroHandler(
         }
     }
 
-    private async Task SubirDocumentos(
+    /// <summary>
+    /// Sube a LumoSys los documentos de SICAS que todavía no estén registrados.
+    /// Devuelve cuántos quedaron guardados en esta pasada (0 si ya estaban todos o si fallaron).
+    /// </summary>
+    private async Task<int> SubirDocumentos(
         int siniestroId, string noReporte, List<ArchivoSICAS> archivos, CancellationToken ct)
     {
+        int guardados = 0;
+
         foreach (var archivo in archivos.Where(a => !string.IsNullOrEmpty(a.PathWWW)))
         {
             try
@@ -264,6 +307,15 @@ public sealed class ProcesarLoteSiniestroHandler(
             string nombreBase = Path.GetFileNameWithoutExtension(archivo.NombreArchivo);
             if (await siniestroRepo.ExisteDocumentoAsync(siniestroId, nombreBase, ct))
                 continue;
+
+            // El corte va ANTES de la descarga: lo que se quiere ahorrar es traer de SICAS un
+            // archivo que no hay dónde guardar.
+            if (_almacenamientoDescartado)
+            {
+                _documentosIntentados++;
+                _documentosFallidos++;
+                continue;
+            }
 
             _documentosIntentados++;
 
@@ -288,10 +340,14 @@ public sealed class ProcesarLoteSiniestroHandler(
                 monitoreo.RastrearFallo("siniestros.subir-documentos",
                     $"No se pudo subir al FTP el documento {archivo.NombreArchivo}",
                     ("folio_siniestro", noReporte), ("archivo", archivo.NombreArchivo));
+
+                AnotarFalloDeAlmacenamiento();
                 continue;
             }
 
             await siniestroRepo.RegistrarDocumentoAsync(siniestroId, nombreFinal, ct);
+            guardados++;
+            _fallosFtpSeguidos = 0; // el FTP respondió: la racha se reinicia
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -306,6 +362,32 @@ public sealed class ProcesarLoteSiniestroHandler(
                     archivo.NombreArchivo, noReporte);
             }
         }
+
+        return guardados;
+    }
+
+    /// <summary>
+    /// Suma un fallo de almacenamiento y, al llegar al tope, corta los intentos de lo que resta de
+    /// la corrida. Emite UN evento al cortar: el saldo detallado lo da <c>ReportarResumenDocumentos</c>.
+    /// </summary>
+    private void AnotarFalloDeAlmacenamiento()
+    {
+        if (_almacenamientoDescartado)
+            return;
+
+        _fallosFtpSeguidos++;
+        if (_fallosFtpSeguidos < MaxFallosFtpSeguidos)
+            return;
+
+        _almacenamientoDescartado = true;
+
+        log.LogError("Se corta la subida de documentos: {N} fallos seguidos de almacenamiento. El resto de la corrida no intentará guardar documentos.",
+            _fallosFtpSeguidos);
+
+        monitoreo.ReportarFalloCritico("siniestros.documentos",
+            $"{_fallosFtpSeguidos} fallos seguidos al almacenar documentos; se corta el intento por el resto de la corrida",
+            "ningun-documento-de-la-corrida-se-almacena",
+            ("fallos_seguidos", _fallosFtpSeguidos.ToString()));
     }
 
     /// <summary>
@@ -629,6 +711,164 @@ public sealed class ProcesarLoteSiniestroHandler(
             monitoreo.Capturar(ex, "siniestros.reconciliacion",
                 ("consecuencia", "el-desfase-de-estatus-no-se-corrige"));
             log.LogError(ex, "Error en la reconciliación de siniestros abiertos.");
+        }
+    }
+
+    /// <summary>
+    /// Fase 4. Vuelve a preguntarle al Centro Digital de SICAS por los siniestros que pueden haber
+    /// recibido documentos después de su alta.
+    ///
+    /// Éste era el hueco: <c>SubirDocumentos</c> solo se invocaba desde la Fase 1, que filtra por
+    /// <c>DatSiniestros.FCaptura</c> —la fecha de ALTA—. El ajustador sube el DUA, las fotos y la
+    /// ODA días después, cuando ese siniestro ya salió de la ventana del barrido y nadie vuelve a
+    /// mirarlo: la Fase 3 revisa estatus y bitácora, pero nunca el Centro Digital.
+    ///
+    /// Medido el 13/10/2026 contra SICAS real: de 623 siniestros sin un solo documento en LumoSys,
+    /// **225 sí los tenían en SICAS** (467 archivos). Y el dato que define el alcance de esta fase:
+    /// **159 de esos 225 ya estaban CERRADOS**. Por eso no basta con recorrer los abiertos —el caso
+    /// que lo destapó, 1-202-2026-R-7234, está en FECHA DE RESOLUCIÓN con sus 3 archivos en SICAS—
+    /// y la consulta incluye también los registrados dentro de la ventana, sin importar su estatus.
+    ///
+    /// No hace falta filtrar aquí lo ya migrado: <c>SubirDocumentos</c> consulta
+    /// <c>ExisteDocumentoAsync</c> archivo por archivo, así que repasar un siniestro que ya está
+    /// completo cuesta una llamada a SICAS y ninguna escritura.
+    /// </summary>
+    private async Task RevisarDocumentosTardios(bool completa, CancellationToken ct)
+    {
+        List<SiniestroParaDocumentos> candidatos;
+        try
+        {
+            candidatos = await siniestroRepo.ObtenerParaRevisionDocumentalAsync(
+                DiasRevisionDocumental, completa, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Paro del servicio en mitad de la consulta. No es un fallo: sin este filtro, cada
+            // reinicio o despliegue dejaría un CRÍTICO falso en Sentry diciendo que dbLumoSys
+            // está caída.
+            log.LogInformation("Fase 4 — cancelada por paro del servicio antes de empezar.");
+            return;
+        }
+        catch (Exception ex)
+        {
+            // Si dbLumoSys no responde ni siquiera se puede saber qué revisar. Es crítico y no
+            // silencioso: sin esta señal, la fase termina "sin novedades" y nadie distingue
+            // "no había nada que migrar" de "la base de datos está caída".
+            monitoreo.ReportarFalloCritico("siniestros.documentos-tardios",
+                $"No se pudo consultar dbLumoSys para listar los siniestros a revisar: {ex.Message}",
+                "la-sincronizacion-de-documentos-no-se-ejecuto",
+                ("modo", completa ? "completa" : "incremental"));
+            monitoreo.Capturar(ex, "siniestros.documentos-tardios",
+                ("consecuencia", "la-sincronizacion-de-documentos-no-se-ejecuto"));
+            log.LogError(ex, "Fase 4 — no se pudo obtener la lista de siniestros a revisar.");
+            return;
+        }
+
+        try
+        {
+            log.LogInformation("Fase 4 — Documentos: {Total} siniestro(s) por revisar (modo {Modo}).",
+                candidatos.Count, completa ? "COMPLETO" : $"incremental: abiertos + sin documentos + últimos {DiasRevisionDocumental} días");
+
+            int conNovedad = 0, recuperados = 0, fallidos = 0, listadosVacios = 0, listadosFallidos = 0;
+
+            foreach (var candidato in candidatos)
+            {
+                if (_almacenamientoDescartado)
+                {
+                    // El cortacircuitos ya disparó: seguir recorriendo solo gastaría llamadas a
+                    // SICAS para documentos que no hay dónde guardar.
+                    log.LogWarning("Fase 4 — se interrumpe la revisión: el almacenamiento está caído.");
+                    break;
+                }
+
+                try
+                {
+                    var archivos = await sicasClient.BuscarDigital(candidato.FolioSicas, ct);
+                    if (archivos.Count == 0)
+                    {
+                        listadosVacios++;
+                        continue;
+                    }
+
+                    int guardados = await SubirDocumentos(
+                        candidato.SiniestroId, candidato.NoReporte, archivos, ct);
+
+                    if (guardados > 0)
+                    {
+                        conNovedad++;
+                        recuperados += guardados;
+
+                        log.LogInformation("Fase 4 — {NoReporte}: {N} documento(s) recuperados del Centro Digital.",
+                            candidato.NoReporte, guardados);
+
+                        monitoreo.Rastrear("siniestros.documentos-tardios",
+                            $"{candidato.NoReporte}: {guardados} documento(s) que SICAS publicó después del alta",
+                            ("folio_siniestro", candidato.NoReporte),
+                            ("siniestro_id", candidato.SiniestroId.ToString()),
+                            ("documentos", guardados.ToString()));
+                    }
+
+                    await Task.Delay(200, ct); // mismo criterio que las fases 1 y 3: no saturar SICAS
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    // Un siniestro problemático no debe cortar la revisión de los demás.
+                    fallidos++;
+                    listadosFallidos++;
+                    monitoreo.Capturar(ex, "siniestros.documentos-tardios",
+                        ("folio_siniestro", candidato.NoReporte),
+                        ("siniestro_id", candidato.SiniestroId.ToString()),
+                        ("consecuencia", "este-siniestro-sigue-sin-su-documentacion"));
+
+                    log.LogError(ex, "Fase 4 — error revisando documentos de {NoReporte}; se continúa.",
+                        candidato.NoReporte);
+                }
+            }
+
+            log.LogInformation("Fase 4 — terminada: {ConNovedad} siniestro(s) con documentos nuevos, {Recuperados} archivo(s) recuperado(s), {Fallidos} con error.",
+                conNovedad, recuperados, fallidos);
+
+            // Si SICAS no devolvió NI UN archivo en todo el recorrido, no es que no hubiera nada
+            // que migrar: es que no se le pudo preguntar. BuscarDigital devuelve lista vacía tanto
+            // ante un siniestro sin documentos como ante un fallo HTTP, así que desde dentro del
+            // bucle los dos casos son idénticos — solo el agregado los distingue. El umbral evita
+            // alertar cuando el recorrido es de un puñado de siniestros y el cero sí es plausible.
+            const int MinimoParaSospechar = 25;
+            if (candidatos.Count >= MinimoParaSospechar && listadosVacios + listadosFallidos == candidatos.Count)
+            {
+                monitoreo.ReportarFalloCritico("siniestros.documentos-tardios",
+                    $"SICAS no devolvió documentos para ninguno de los {candidatos.Count} siniestros revisados",
+                    "no-se-sincronizo-ningun-documento-probable-caida-de-sicas",
+                    ("modo", completa ? "completa" : "incremental"),
+                    ("revisados", candidatos.Count.ToString()),
+                    ("listados_vacios", listadosVacios.ToString()),
+                    ("listados_con_error", listadosFallidos.ToString()));
+
+                log.LogError("Fase 4 — ninguno de los {Total} siniestros devolvió documentos: se sospecha caída de SICAS, no ausencia de documentos.",
+                    candidatos.Count);
+            }
+
+            monitoreo.Rastrear("siniestros.documentos-tardios", "Fase 4 finalizada",
+                ("modo", completa ? "completa" : "incremental"),
+                ("revisados", candidatos.Count.ToString()),
+                ("siniestros_con_novedad", conNovedad.ToString()),
+                ("documentos_recuperados", recuperados.ToString()),
+                ("listados_vacios", listadosVacios.ToString()),
+                ("fallidos", fallidos.ToString()));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Paro del servicio: lo ya migrado queda bien y la siguiente pasada retoma. No se
+            // reporta — un despliegue no es un incidente.
+            log.LogInformation("Fase 4 — interrumpida por paro del servicio; se reanuda en la próxima pasada.");
+        }
+        catch (Exception ex)
+        {
+            // Mismo criterio que las fases 2 y 3: su fallo no invalida lo ya guardado, pero la
+            // consecuencia —los siniestros se quedan sin su documentación— no deja rastro en la BD.
+            monitoreo.Capturar(ex, "siniestros.documentos-tardios",
+                ("consecuencia", "los-documentos-publicados-despues-del-alta-no-se-recuperan"));
+            log.LogError(ex, "Error en la revisión de documentos tardíos.");
         }
     }
 

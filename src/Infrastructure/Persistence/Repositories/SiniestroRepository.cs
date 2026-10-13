@@ -401,6 +401,49 @@ public sealed class SiniestroRepository(LumoSysContext db) : ISiniestroRepositor
         await db.SaveChangesAsync(ct);
     }
 
+    public async Task<List<SiniestroParaDocumentos>> ObtenerParaRevisionDocumentalAsync(
+        int diasAtras, bool completa, CancellationToken ct = default)
+    {
+        var baseQuery = db.Siniestros
+            .Where(s => s.SIN_NO_REPORTE != null && s.SIN_FOLIO_SICAS != null);
+
+        if (!completa)
+        {
+            var idsAbiertos = await db.TiposEstatus
+                .Where(t => t.TES_TMO_ID == TMO_ID_SINIESTROS
+                         && (t.TES_DESCRIPCION == "EN TRAMITE" || t.TES_DESCRIPCION == ESTATUS_SOLICITUD))
+                .Select(t => t.TES_ID)
+                .ToListAsync(ct);
+
+            DateTime desde = DateTime.Now.Date.AddDays(-Math.Abs(diasAtras));
+
+            // Tres conjuntos, y los tres hacen falta:
+            //  (1) los que NO tienen ningún documento — es el universo de la puesta al día, y se
+            //      vacía solo conforme se migran, así que no hay estado que mantener;
+            //  (2) los que siguen abiertos, sin importar su antigüedad;
+            //  (3) los registrados dentro de la ventana, aunque estén cerrados — que es de donde
+            //      salían 159 de los 225 pendientes medidos el 13/10/2026.
+            baseQuery = baseQuery.Where(s =>
+                !db.DocumentosSiniestros.Any(d => d.DSI_SIN_ID == s.SIN_ID)
+                || s.SIN_FECHA_REGISTRO >= desde
+                || idsAbiertos.Contains(
+                       db.SiniestrosEstatus
+                         .Where(e => e.SES_SIN_ID == s.SIN_ID)
+                         .OrderByDescending(e => e.SES_FECHA_REGISTRO)
+                         .ThenByDescending(e => e.SES_ID)
+                         .Select(e => e.SES_TES_ID)
+                         .FirstOrDefault()));
+        }
+
+        return await baseQuery
+            .OrderByDescending(s => s.SIN_FECHA_REGISTRO)
+            .Select(s => new SiniestroParaDocumentos(
+                s.SIN_ID,
+                s.SIN_NO_REPORTE!,
+                s.SIN_FOLIO_SICAS!.Value))
+            .ToListAsync(ct);
+    }
+
     public async Task<bool> ExisteDocumentoAsync(
         int siniestroId, string nombreBase, CancellationToken ct = default)
     {

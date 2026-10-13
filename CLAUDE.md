@@ -127,6 +127,42 @@ Sentry.Excludes                  → rutas extra a excluir del APM, separadas po
 - La cuenta de Windows `Jesus` (usada por `Ftp.Usuario`/`Ftp.Contrasena` en `appsettings.Local.json`) tenía marcado **"El usuario debe cambiar la contraseña en el siguiente inicio de sesión"**, lo cual bloquea el login FTP con `530 User cannot log in` (sin mensaje de detalle) — no hay forma de cambiar la contraseña vía FTP. Se corrigió desmarcando esa opción y marcando "La contraseña nunca expira" (para que no se repita cuando la contraseña expire).
 - Si este error vuelve a aparecer, revisar en este orden: (1) permisos NTFS de la cuenta sobre la ruta física del sitio, (2) reglas de autorización FTP (`Jesus` debe estar en la lista con Leer+Escribir), (3) autenticación FTP habilitada (básica sí, anónima no), (4) estado de la cuenta de Windows (deshabilitada/bloqueada/contraseña por cambiar).
 
+- **⚠️ Estado al 13/10/2026: el FTP está rechazando el login, con un error DISTINTO al de 2026-07.**
+  La cuenta configurada hoy en `appsettings.Local.json` ya no es `Jesus` sino **`Sicas FTP`** (con
+  espacio en el nombre), y el diálogo crudo contra `10.100.102.6:21` responde:
+
+  ```
+  220 Microsoft FTP Service
+  USER Sicas FTP   → 331 Password required
+  PASS ********    → 530 User cannot log in, home directory inaccessible.
+  ```
+
+  La coletilla `home directory inaccessible` es la parte informativa: no es "contraseña incorrecta"
+  ni "debe cambiar la contraseña" (ésos dan `530 User cannot log in.` a secas). IIS llegó a resolver
+  la cuenta y falló al abrir su directorio raíz. Con el sitio configurado en **autenticación de paso
+  a través**, IIS accede al sistema de archivos suplantando a la propia cuenta FTP, así que el
+  sospechoso número uno son los **permisos NTFS de `Sicas FTP` sobre
+  `C:\inetpub\wwwroot\LumoSys\Content\Documentos`**, y el número dos el **aislamiento de usuarios**
+  del sitio FTP. Ver la sección de diagnóstico paso a paso más abajo.
+
+  Consecuencia mientras dure: **ningún documento de póliza ni de siniestro se puede almacenar**,
+  aunque SICAS los entregue y el resto del ETL funcione.
+
+- **⚠️ Pero el FTP de PRODUCCIÓN sí funcionaba.** No hay que confundir el entorno local con el
+  servidor. Evidencia en `dbLumoSys`: se escribieron documentos de póliza el **28/09/2026** (23
+  archivos) y el 22/09/2026 (7). Es decir, dos semanas antes de este diagnóstico el flujo
+  almacenaba sin problema. El `530` de arriba se obtuvo desde una terminal de desarrollo con las
+  credenciales de `appsettings.Local.json`, que **no son necesariamente las del servidor** — el
+  publish copia ese archivo, pero en el servidor puede estar actualizado.
+
+  Conclusión operativa: **no dar por caído el FTP de producción sin un evento de Sentry que lo
+  demuestre.** Para eso `FtpDocumentService` emite ahora `ftp.login` como fallo crítico con el
+  código y la respuesta literal del servidor (ver abajo).
+
+- **Último documento escrito, por tipo** (medido 13/10/2026): pólizas 28/09/2026, siniestros
+  **18/08/2026**. Los siniestros llevan casi dos meses sin recibir nada, y no es por el FTP —las
+  pólizas siguieron entrando un mes más—: es el hueco estructural de la Fase 4 (ver su sección).
+
 ## SICAS REST
 
 - Base URL real: `https://security-services.sicasonline.info/api` (la URL `lumo.intelisiscloud.com:9081` documentada antes era incorrecta/inalcanzable).
@@ -488,6 +524,296 @@ muestra la secuencia completa: `ReadData H03117 falló: InternalServerError` →
 `Lote Seguros finalizado. 0 pólizas encontradas en el rango.` → `Envelope successfully sent`. El ETL
 se comporta igual que antes —la petición sigue devolviendo `HTTP 200`— pero el fallo ya no es
 invisible.
+
+## Documentos digitales SICAS → Fleet: la cadena estaba rota en tres puntos (13/10/2026)
+
+Reporte de producción: "los archivos digitales de SICAS no están llegando a Fleet". El barrido
+encontró **tres fallas independientes**, ninguna de las cuales producía un error visible.
+
+### 1. Los documentos nunca se enviaban a SFleet — la llamada no existía
+
+`ISFleetClient.SubirDocumento` estaba implementado completo en `SFleetClient` (líneas 228-270) y
+**nadie lo llamaba**. `SincronizarSFleet` recibía el parámetro `archivos` y lo ignoraba por
+completo: no aparecía ni una vez en el cuerpo del método.
+
+No fue una regresión posterior, sino una pérdida en la reescritura: el ETL legacy sí lo hacía
+(`C:\LumoSysGit\Seguros\Generales\Procesar.cs:215`, un `foreach` sobre
+`polizaLumoSys.Vehiculo.Documentos` llamando a `GuardarSeguroDocumento` justo después del alta).
+El método se portó, el `foreach` no. Confirmado con `git log --all -S "sfleetClient.SubirDocumento"`:
+cero resultados en toda la historia del repo. **Desde `bdcbb09` (29/07/2026) ningún documento de
+SICAS llegó jamás a SFleet.**
+
+Corregido: los bytes que ya se descargan para el FTP se conservan en `DocumentoDescargado` y se
+reutilizan; `AdjuntarDocumentosSFleet` los sube después del alta de la póliza (el documento se
+cuelga de ella vía `serviable_id`, así que el orden no es negociable). Cada documento se aísla en
+su propio try-catch y hay saldo de corrida propio (`_sfleetDocsIntentados`/`_sfleetDocsFallidos`).
+
+### 2. Aunque se llamara, no había póliza a la que adjuntar (el 422)
+
+`GuardarPoliza` mandaba 8 campos; el legacy mandaba ~40. SFleet contestaba **422 a todas las
+pólizas**, `GuardarPoliza` devolvía 0 y no existía `serviable_id`. El propio código lo admitía en
+un comentario, y en `docs/sentry-reglas-de-alerta.md` el 422 estaba clasificado como
+"Warning / informativa" — es decir, **la alerta del problema raíz estaba silenciada**.
+
+Corregido: el cuerpo de `request_insurance` reproduce el contrato completo del legacy, incluidos
+`insurer_id` (nuevo `ResolverAseguradoraId`, GET `/insurers`, cacheado por instancia scoped) y
+`catalogue_id = 15`. Los campos que SICAS no provee van en `0`/vacío, igual que en el legacy, para
+no alterar la forma del payload. `rc_aditionals` va en `null` a propósito: SICAS no lo entrega y
+`SDE_AMPARO_RC_ADICIONALES` se guarda nulo, así que rellenarlo con otra cobertura sería inventar.
+
+⚠️ **Esto destraba por primera vez escrituras reales contra SFleet productivo.** Hasta ahora el 422
+las bloqueaba todas. Validar en el primer barrido que las altas se crean bien y que no aparecen
+duplicados.
+
+### 3. Guarda en el PATCH (requisito de la corrección anterior)
+
+`BuscarPoliza` usa la búsqueda difusa `q=` de SFleet y devolvía `.FirstOrDefault()`. Ese id iba a
+la ruta de un `PATCH`: con el payload arreglado, un resultado que no fuera la póliza buscada habría
+**sobrescrito la póliza de otro cliente**. Hasta ahora no ocurrió solo porque el 422 lo impedía.
+
+Corregido: `BuscarPoliza` solo devuelve un id cuando el campo `police` del registro coincide
+exactamente (sin distinguir mayúsculas ni espacios) con el número buscado. Si hay resultados pero
+ninguno exacto, devuelve `null` y reporta — el llamador da de alta, que a lo sumo deja un duplicado
+reversible en vez de destruir datos ajenos.
+
+### 4. Del lado LumoSys/FTP: documentos descartados por un falso positivo
+
+`PolizaRepository.ExisteDocumentoAsync(serie, nombreArchivo)` **ignoraba el parámetro `serie`** y
+además comparaba con `.Contains(...)` en vez de igualdad. Preguntaba si *alguna* unidad del sistema
+tenía un documento `DUN_TDW_ID = 4` cuyo nombre contuviera ese texto. Con los nombres genéricos que
+manda SICAS, el primer documento cargado para cualquier vehículo hacía que los de todos los demás
+se descartaran como "ya existe" y nunca se subieran. Presente desde el commit inicial.
+
+Corregido: se acota al vehículo real (`DUN_CDE_ID` → `COMPRAS_DETALLES.CDE_NO_SERIE`) y se compara
+por igualdad. El equivalente de siniestros (`SiniestroRepository.ExisteDocumentoAsync`) ya filtraba
+bien por `siniestroId`; solo el de seguros estaba roto.
+
+### Secundarios corregidos en el mismo barrido
+
+- **Filas huérfanas en `ARCHIVOS_REPOSITORIOS`**: el `ARC_ID` debe existir antes de subir (el nombre
+  remoto *es* el `ARC_ID`), pero si el FTP fallaba la fila se quedaba apuntando a un archivo
+  inexistente y sin vínculo, invisible para cualquier reproceso. Ahora `SubirDocumentoPolizaHandler`
+  llama a `EliminarArchivoAsync` cuando la subida no se concreta. El folio de la secuencia sí se
+  consume: eso no es reversible y no importa.
+- **`ARC_TMM_ID` fijo en 2 (PDF)**: se mantiene, porque el catálogo `TIPOS_MULTIMEDIA` no está
+  modelado en este proyecto y no hay forma de resolver el id real de otra extensión sin inventarlo.
+  Pero ahora, cuando el archivo no es `.pdf`, se reporta en vez de pasar en silencio. **Pendiente**:
+  modelar el catálogo y mapear la extensión de verdad.
+
+### Pendiente / conocido (no tocado)
+
+- `VincularDocumentoUnidadAsync` resuelve la serie con `FirstOrDefaultAsync(x => x.CDE_NO_SERIE == serie)`
+  sin el filtro de estatus de compra que sí aplica `ResolverOrigenVehiculoAsync` (`COM_TES_ID`).
+  Puede vincular el documento a una compra cancelada si hay varias filas con la misma serie.
+- Nada de esto se pudo probar contra SICAS/SFleet/FTP reales desde el entorno de desarrollo: la
+  verificación fue estática (compila sin advertencias) y por lectura del contrato legacy. **La
+  validación end-to-end está pendiente.**
+
+## Siniestros: los documentos solo se miraban una vez (13/10/2026)
+
+Reporte de operaciones sobre el siniestro `1-202-2026-R-7234`: "no hay nada cargado, fotos de los
+daños, volante". Verificado contra SICAS y `dbLumoSys` en vivo.
+
+### El hueco
+
+`SubirDocumentos` se invocaba **únicamente** desde `ProcesarSiniestroCompleto`, es decir desde la
+Fase 1, que filtra por `DatSiniestros.FCaptura` — la fecha de **alta** del siniestro. El ajustador
+sube el DUA, las fotografías y la ODA días después, cuando ese folio ya salió de la ventana del
+barrido. La Fase 3 (`ReconciliarAbiertos`) sí vuelve a visitar el siniestro cada día, pero solo
+miraba **estatus y bitácora**: nunca el Centro Digital. Nadie volvía a preguntar por los archivos.
+
+Magnitud medida el 13/10/2026 sobre `dbLumoSys`:
+
+| Año de registro | Siniestros con `SIN_FOLIO_SICAS` | Sin un solo documento |
+|---|---|---|
+| 2026 | 884 | **618** |
+| 2025 | 100 | 0 |
+| 2024 | 141 | 1 |
+| 2023 | 125 | 2 |
+| 2022 | 131 | 1 |
+
+Los años anteriores están sanos porque los migró el ETL legacy. **El hueco nace con este proyecto.**
+
+### Cuánto falta de verdad: barrido contra SICAS (13/10/2026)
+
+Se revisaron contra `/DigitalCenter/GetFiles` los **623** siniestros con `SIN_FOLIO_SICAS` y cero
+documentos en LumoSys. Resultado, sin un solo error de consulta:
+
+| | Siniestros | Archivos en SICAS |
+|---|---|---|
+| **Con documentos pendientes de migrar** | **225** | **467** |
+| Sin documentos en SICAS (nada que traer) | 398 | — |
+
+Y el dato que define el diseño de la corrección:
+
+| Estatus en LumoSys | Siniestros | Archivos |
+|---|---|---|
+| **FECHA DE RESOLUCIÓN (cerrados)** | **159** | 277 |
+| EN TRAMITE | 66 | 190 |
+
+**Dos de cada tres siniestros con documentos pendientes ya están cerrados.** El ajustador sube el
+expediente *después* de que se resuelve el caso. El propio folio que originó el reporte,
+`1-202-2026-R-7234`, está en FECHA DE RESOLUCIÓN con sus 3 archivos esperando en SICAS.
+
+### Corregido — Fase 4, y por qué no bastaba con los abiertos
+
+El primer intento metió la revisión dentro de `ReconciliarAbiertos`, que solo recorre siniestros
+EN TRAMITE/SOLICITUD. El barrido demostró que eso habría recuperado 66 de 225: **el caso reportado
+habría seguido roto**. Se rehízo como fase propia.
+
+`RevisarDocumentosTardios` (Fase 4) corre después de la Fase 3, solo en el barrido diario, sobre la
+unión de dos conjuntos (`ISiniestroRepository.ObtenerParaRevisionDocumentalAsync`):
+
+1. Los que siguen **abiertos**, sin importar su antigüedad.
+2. Los registrados en los últimos **90 días** (`DiasRevisionDocumental`), **aunque estén cerrados**.
+
+No necesita localizar el siniestro en SICAS como hace la Fase 3: `SIN_FOLIO_SICAS` **es** el
+`IDSiniestro` que `GetFiles` espera como `ValuePK`, así que va directo. Tampoco filtra lo ya
+migrado: `SubirDocumentos` consulta `ExisteDocumentoAsync` archivo por archivo, de modo que repasar
+un siniestro completo cuesta una llamada a SICAS y ninguna escritura. Ahora devuelve cuántos guardó.
+
+Cobertura verificada con la consulta equivalente contra la BD real: **701 candidatos** por corrida,
+que cubren **211 de los 225** pendientes, incluido `1-202-2026-R-7234`.
+
+Los **15 que quedan fuera** son todos de junio–julio de 2026 —el arranque del integrador—, cerrados
+y con 1-3 archivos cada uno. Son cola histórica, no un patrón que se repita: se resuelven una sola
+vez con reproceso manual por folio, no ensanchando la ventana diaria a 180 días (que llevaría el
+recorrido de 701 a ~890 siniestros todos los días para siempre).
+
+### Sincronización al desplegar (13/10/2026)
+
+Quien opera este integrador **no administra el FTP ni tiene acceso al servidor**, así que el
+despliegue tiene que ponerse al día solo. `SincronizacionDocumentalBackgroundService` corre dos
+minutos después de cada arranque y lanza la Fase 4 en modo **COMPLETO**: recorre los 1,408
+siniestros vinculados a SICAS, sin ventana de días ni filtro de estatus. El barrido nocturno sigue
+corriéndola en modo **incremental** (780 siniestros hoy).
+
+| Modo | Cuándo | Universo | Hoy | Medido |
+|---|---|---|---|---|
+| Completo | 2 min tras cada arranque **y cada noche** (`EtlSchedule:Documentos`, 01:00) | todos con `SIN_FOLIO_SICAS` | 1,408 | 1.7 s la consulta |
+| Incremental | solo vía endpoint (`completa=false`) | sin documentos ∪ abiertos ∪ últimos 90 días | 780 | 0.5 s |
+
+La pasada nocturna es completa y no incremental porque el modo incremental tiene un **punto ciego
+por diseño**: un siniestro antiguo, cerrado y que YA tiene documentos no entra en ninguno de sus
+tres conjuntos, así que si SICAS le agrega un archivo años después, nadie lo ve. Medido el
+13/10/2026: **91 siniestros, casi todos de 2022-2023, con 140 archivos** que SICAS tiene y LumoSys
+no (finiquitos, denuncias, cartas de liberación subidos mucho después del cierre).
+
+La Fase 4 **ya no se invoca desde el barrido nocturno de siniestros**: la ejecuta solo este
+servicio. Llamarla desde los dos sitios significaba recorrer SICAS dos veces por noche —780
+consultas en incremental más 1,408 en completo— para el mismo resultado.
+
+**Lo que hay pendiente de migrar hoy, en total:**
+
+| Situación en LumoSys | Siniestros | Archivos |
+|---|---|---|
+| Sin ningún documento, teniéndolos SICAS | 225 | 467 |
+| Con documentación parcial | 91 | 140 |
+| **Total** | **316** | **607** |
+
+**Por qué no duplica**: `SubirDocumentos` consulta `ExisteDocumentoAsync` archivo por archivo
+*antes* de descargar, comparando contra `DOCUMENTOS_SINIESTROS.DSI_ARCHIVO` con el patrón
+`{base}_` — que es como se guardan (`{base}_3_{ddMMyyHHmmss}{ext}`). Un siniestro ya completo cuesta
+una llamada a SICAS y **cero** escrituras, así que repetir la pasada en cada reinicio es seguro.
+Límite conocido: dos archivos distintos con el mismo nombre base dentro del mismo siniestro se
+tratan como uno solo; no se ha observado en los datos reales.
+
+También está `POST /api/Etl/Siniestros/Documentos?completa=true|false` para repetirla bajo demanda
+—por ejemplo en cuanto se corrija el acceso al FTP— sin reiniciar el servicio.
+
+### Señales en Sentry para un operador sin acceso al servidor
+
+Lo que esta persona no puede hacer (entrar al servidor, probar el FTP, leer el log en disco) tiene
+que llegarle como evento. Los tres bloqueos posibles emiten **fallo crítico**, que es el nivel sobre
+el que están configuradas las notificaciones:
+
+| Qué se cayó | Evento | Qué dice |
+|---|---|---|
+| dbLumoSys | `siniestros.documentos-tardios` | `la-sincronizacion-de-documentos-no-se-ejecuto` — no se pudo ni listar qué revisar |
+| SICAS | `siniestros.documentos-tardios` | `no-se-sincronizo-ningun-documento-probable-caida-de-sicas` |
+| SICAS (token) | `sicas.token` | `ningun-registro-se-sincroniza-desde-sicas` (ya existía) |
+| FTP | `ftp.login` | código y respuesta literal del servidor + qué pedirle al administrador |
+
+La señal de SICAS merece explicación: `BuscarDigital` devuelve lista vacía tanto ante un siniestro
+sin documentos como ante un fallo HTTP, así que desde dentro del bucle los dos casos son idénticos.
+Solo el agregado los distingue — si **ninguno** de 25+ siniestros revisados devolvió un archivo, no
+es que no hubiera nada: es que no se pudo preguntar.
+
+### El evento de FTP lleva su propio diagnóstico
+
+`FtpDocumentService` ya no reporta "error de FTP" a secas. Distingue `FtpAuthenticationException`
+(rechazo de login → crítico) de `FtpCommandException` (550 y similares) y adjunta `ftp_codigo`,
+`ftp_respuesta`, `ftp_usuario`, `ftp_ruta` y un campo **`diagnostico`** en español que dice la causa
+y **qué pedirle al administrador del FTP**. El objetivo es que ese texto se pueda copiar del evento
+y pegar en la solicitud, sin que nadie tenga que interpretar un código FTP. Los casos cubiertos:
+`530 home directory` (permisos NTFS / aislamiento de usuarios), `530` de contraseña, `530` genérico,
+`550`, `553` y los `4xx` temporales.
+
+### ⚠️ SFleet responde 401 a TODO (13/10/2026)
+
+Comprobado en vivo contra `https://fleetsoluciones.com/api/v1` con las credenciales de
+`appsettings.Local.json`:
+
+- `POST /authentications` → **200**, devuelve `token_type: Bearer` y un JWT cuyas claims son
+  `{"sub":4894,"email":"conexionapi@lumofc.com"}` (sin expiración).
+- `GET /client_cars`, `/client_cars?q=…`, `/request_insurances`, `/insurers` → **401** los cuatro.
+- Probado con `Bearer <token>`, el token sin prefijo, `Token token=<token>` y `X-Auth-Token`: 401
+  en todas las variantes.
+
+O sea: **autentica pero no autoriza**. No es el 422 que documentaba el código — ese diagnóstico está
+desactualizado. Y la consecuencia es más grave de lo que parecía: `BuscarVehiculo` es la PRIMERA
+llamada de `SincronizarSFleet`, así que devuelve null, la función retorna antes de tocar
+`GuardarPoliza` y **ninguna póliza llega nunca a SFleet**. El payload reconstruido no alcanza
+siquiera a enviarse.
+
+Mismo matiz que con el FTP: son las credenciales del entorno de desarrollo y **podrían no ser las
+de producción**. Hay que confirmarlo con un evento real.
+
+**Agujero de observabilidad corregido junto con esto**: ese escenario era completamente mudo.
+`SincronizarSFleet` retornaba antes de incrementar `_sfleetIntentos`/`_sfleetFallos`, así que el
+resumen de la corrida veía 0 y 0 y no emitía nada — el ETL se declaraba exitoso sin haber
+sincronizado una sola póliza. Ahora se cuentan aparte las series buscadas y las no encontradas, y
+si **ninguna** de 5+ aparece, se emite `sfleet.buscar-vehiculo` como **fallo crítico** con la
+consecuencia `ninguna-poliza-llego-a-sfleet-probable-fallo-de-acceso-no-series-inexistentes`.
+
+### Pólizas: medido, y no tiene este problema
+
+Se comprobó si el mismo hueco existía del lado de Seguros: de **2,440** unidades aseguradas desde
+el 29/07/2026, solo **31** no tienen documento de póliza (1.3%). No se construyó una Fase 4
+equivalente para pólizas, y es una decisión medida, no un olvido: además de que el hueco es
+marginal, `SEGUROS` **no tiene columna de vínculo con SICAS** (no hay equivalente a
+`SIN_FOLIO_SICAS`), así que cada póliza necesitaría dos llamadas a SICAS —una para resolver el
+`IDDocto` por número de póliza y otra para listar— en vez de una.
+
+### Cortacircuitos de almacenamiento
+
+La Fase 4 multiplica por ~700 los intentos diarios de guardar documentos. Con el FTP caído eso
+significaría descargar de SICAS cientos de MB cada noche para tirarlos en el último paso —el PDF de
+fotografías de un solo siniestro pesa 14.7 MB—. `AnotarFalloDeAlmacenamiento` corta los intentos
+tras **5 fallos seguidos** de FTP dentro de la misma corrida, emite un evento crítico y detiene el
+recorrido de la Fase 4. El corte va **antes** de la descarga, que es el gasto que se quiere evitar;
+un guardado exitoso reinicia la racha.
+
+### Hipótesis descartada
+
+`ReadRecursive = false` **no** es el problema, aunque el Centro Digital muestre los archivos dentro
+de una subcarpeta `Siniestro_<folio>`. Probado contra SICAS real con `ValuePK` 35635 y 35743: las
+dos variantes devuelven exactamente los mismos elementos.
+
+### Trampa al diagnosticar: el número de la ventana del Centro Digital NO es el IDSiniestro
+
+El título "Centro digital [20260000207208]" es el **NumReporte**, no el `IDSiniestro` que espera
+`GetFiles` como `ValuePK`. En este caso `20260000207208` resultó ser un siniestro **distinto** al
+reportado, de otro vehículo y otro cliente:
+
+| | Folio | SIN_ID | IDSiniestro | Serie | Cliente |
+|---|---|---|---|---|---|
+| Reportado | `1-202-2026-R-7234` | 34723 | 35635 | `JN6BE6CSXK9055450` | 495 |
+| El de la captura | `20260000207208` | 34776 | 35743 | `1FTEW1KP2RKD13525` | 572 |
+
+Antes de actuar sobre una captura de pantalla del Centro Digital, resolver siempre el `IDSiniestro`
+real vía `SINIESTROS.SIN_FOLIO_SICAS`. Subir el expediente equivocado mete documentación de otro
+cliente en un expediente ajeno.
 
 ## Reprocesamiento individual
 

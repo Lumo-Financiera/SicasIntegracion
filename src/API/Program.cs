@@ -64,6 +64,9 @@ try
     builder.Services.AddHostedService<SegurosEtlIntervaloBackgroundService>();
     builder.Services.AddHostedService<SiniestrosEtlBackgroundService>();
     builder.Services.AddHostedService<SiniestrosEtlIntervaloBackgroundService>();
+    // Puesta al día de documentos en cada arranque: es lo que hace que un despliegue sincronice
+    // por sí solo todo lo que haya quedado atrás, sin tocar el servidor (ver el servicio).
+    builder.Services.AddHostedService<SincronizacionDocumentalBackgroundService>();
 
     // ── Controllers ────────────────────────────────────────────────────────────
     // El filtro de monitoreo es global a propósito: etiqueta cada petición con su controlador,
