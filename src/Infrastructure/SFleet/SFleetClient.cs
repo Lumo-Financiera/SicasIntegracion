@@ -24,8 +24,53 @@ public sealed class SFleetOptions
 public sealed class SFleetClient(
     IOptions<SFleetOptions> opts,
     IMonitoreoErrores monitoreo,
+    IDiagnosticoRed diagnosticoRed,
     ILogger<SFleetClient> log) : ISFleetClient, IDisposable
 {
+    /// <summary>Para no repetir el mismo reporte de acceso en cada póliza de la corrida.</summary>
+    private bool _accesoYaReportado;
+
+    /// <summary>
+    /// Reporta, una sola vez por corrida, que SFleet no deja operar — con los datos de conexión
+    /// reales de este servidor.
+    ///
+    /// El caso concreto medido el 13/10/2026: <c>POST /authentications</c> responde 200 y entrega
+    /// un JWT, pero TODOS los endpoints (<c>client_cars</c>, <c>request_insurances</c>,
+    /// <c>insurers</c>) responden 401, con Bearer y sin él. Es decir, autentica pero no autoriza.
+    /// Como <c>BuscarVehiculo</c> es la primera llamada, la sincronización se corta ahí y ninguna
+    /// póliza ni documento llega a Fleet.
+    /// </summary>
+    private async Task ReportarAccesoDenegado(string operacion, int status, string? detalle, CancellationToken ct)
+    {
+        if (_accesoYaReportado) return;
+        _accesoYaReportado = true;
+
+        var red = await diagnosticoRed.SondearUrl("Fleet / SFleet · API", _opts.BaseUrl, ct);
+
+        bool esAutorizacion = status is 401 or 403;
+
+        monitoreo.ReportarFalloCritico("sfleet.acceso",
+            $"SFleet respondió {status} en {operacion}: el servicio no autoriza las llamadas",
+            "ninguna-poliza-ni-documento-llega-a-fleet",
+            ("sfleet_url", _opts.BaseUrl),
+            ("sfleet_email", _opts.Email),
+            ("sfleet_operacion", operacion),
+            ("sfleet_status", status.ToString()),
+            ("sfleet_detalle", detalle),
+            ("red_host", red.Host),
+            ("red_puerto", red.Puerto.ToString()),
+            ("red_dns", red.DnsResuelve ? string.Join(", ", red.Ips) : "NO RESUELVE"),
+            ("red_tcp", red.TcpConecta switch { true => $"OK ({red.MilisegundosTcp} ms)", false => "BLOQUEADO", _ => "no probado" }),
+            ("red_resumen", red.Resumen),
+            ("que_pedir", esAutorizacion && red.Alcanzable
+                ? $"La red hacia {red.Host}:{red.Puerto} está bien y la autenticación devuelve token, pero las " +
+                  $"llamadas responden {status}. NO es un problema de red ni de contraseña: PEDIR AL PROVEEDOR DE FLEET " +
+                  $"que habilite los permisos de API de la cuenta '{_opts.Email}' sobre client_cars, request_insurances " +
+                  "e insurers (lectura y escritura)."
+                : red.QuePedir));
+
+        log.LogError("SFleet: {Operacion} respondió {Status}. {Resumen}", operacion, status, red.Resumen);
+    }
     private readonly RestClient _http = new(opts.Value.BaseUrl);
     private readonly SFleetOptions _opts = opts.Value;
     private string? _token;
@@ -109,6 +154,10 @@ public sealed class SFleetClient(
                     $"SFleet respondió {(int)resp.StatusCode} ({resp.StatusCode})",
                     "poliza-no-sincronizada-se-lee-como-serie-inexistente",
                     ("serie", serie), ("status", ((int)resp.StatusCode).ToString()));
+
+                // Primera llamada de la sincronización: si aquí no se puede operar, nada llega a
+                // Fleet. Se emite el reporte con los datos de conexión reales, una vez por corrida.
+                await ReportarAccesoDenegado("client_cars", (int)resp.StatusCode, resp.Content, ct);
                 return null;
             }
 

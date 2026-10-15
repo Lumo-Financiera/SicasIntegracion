@@ -18,9 +18,42 @@ public sealed class FtpOptions
 public sealed class FtpDocumentService(
     IOptions<FtpOptions> opts,
     IMonitoreoErrores monitoreo,
+    IDiagnosticoRed diagnosticoRed,
     ILogger<FtpDocumentService> log) : IDocumentService
 {
     private readonly FtpOptions _opts = opts.Value;
+
+    /// <summary>
+    /// Puerto de control del FTP. El de datos lo negocia el modo pasivo y es un RANGO, que es el
+    /// bloqueo más común y el menos obvio: el login funciona y la transferencia se queda colgada.
+    /// Por eso el diagnóstico lo menciona explícitamente.
+    /// </summary>
+    private const int PuertoControlFtp = 21;
+
+    /// <summary>
+    /// Sondea el FTP y arma las etiquetas con los datos de conexión REALES de este servidor, para
+    /// adjuntarlas al evento. Sin esto, ante un fallo había que suponer a qué host y puerto se
+    /// estaba conectando el proceso — y la configuración publicada no tiene por qué coincidir con
+    /// la copia local de quien revisa.
+    /// </summary>
+    private async Task<(string, string?)[]> DatosDeConexion(string rutaDestino, CancellationToken ct)
+    {
+        var sondeo = await diagnosticoRed.SondearHost(
+            "FTP de documentos (control)", _opts.Host, PuertoControlFtp, ct);
+
+        return
+        [
+            ("ftp_host", _opts.Host),
+            ("ftp_puerto_control", PuertoControlFtp.ToString()),
+            ("ftp_usuario", _opts.Usuario),
+            ("ftp_ruta", rutaDestino),
+            ("ftp_modo", "pasivo · sin TLS (FtpEncryptionMode.None)"),
+            ("red_dns", sondeo.DnsResuelve ? string.Join(", ", sondeo.Ips) : "NO RESUELVE"),
+            ("red_tcp", sondeo.TcpConecta switch { true => $"OK ({sondeo.MilisegundosTcp} ms)", false => "BLOQUEADO", _ => "no probado" }),
+            ("red_resumen", sondeo.Resumen),
+            ("red_que_pedir", sondeo.QuePedir)
+        ];
+    }
 
     public async Task<bool> SubirDocumentoPoliza(
         string nombreArchivoRemoto, byte[] bytes, CancellationToken ct = default)
@@ -69,30 +102,21 @@ public sealed class FtpDocumentService(
         }
         catch (FtpAuthenticationException ex)
         {
-            // El servidor rechazó el login. Es el fallo que más tiempo ha costado diagnosticar en
-            // este proyecto, y siempre por lo mismo: el evento decía "error de FTP" sin el código
-            // ni el texto del servidor, que es justo lo que distingue una causa de otra.
-            //
-            // Quien opera este servicio NO administra las cuentas del FTP: tiene que reenviarle el
-            // evento a quien sí las administra. Por eso el evento lleva el código crudo, la
-            // respuesta literal y una lectura en español de lo que hay que pedir.
-            ReportarRechazoDeLogin(ex.CompletionCode, ex.Message, rutaDestino, nombreArchivo, ex);
+            await ReportarRechazoDeLoginAsync(ex, rutaDestino, nombreArchivo, ct);
             return 0;
         }
         catch (FtpCommandException ex)
         {
-            // Login correcto pero el comando falló: típicamente 550 (ruta inexistente o sin
-            // permiso de escritura sobre ella). Se separa del caso anterior porque lo que hay que
-            // pedirle al administrador es distinto.
+            var conexion = await DatosDeConexion(rutaDestino, ct);
             monitoreo.Capturar(ex, "ftp.subir-archivo",
-                ("ftp_host", _opts.Host),
-                ("ftp_ruta", rutaDestino),
-                ("ftp_usuario", _opts.Usuario),
+            [
+                ..conexion,
                 ("ftp_codigo", ex.CompletionCode),
                 ("ftp_respuesta", ex.Message),
                 ("archivo", nombreArchivo),
                 ("diagnostico", DiagnosticarFtp(ex.CompletionCode, ex.Message, rutaDestino)),
-                ("consecuencia", "documento-no-subido"));
+                ("consecuencia", "documento-no-subido")
+            ]);
             monitoreo.AgregarDato("archivo_bytes", bytes.Length);
 
             log.LogError(ex, "FTP rechazó el comando ({Codigo}) subiendo {Archivo} a {Ruta}",
@@ -101,16 +125,15 @@ public sealed class FtpDocumentService(
         }
         catch (Exception ex)
         {
-            // Se conserva el retorno 0 (contrato de IDocumentService: el llamador decide si el
-            // documento se reintenta o se omite), pero el fallo se reporta con el destino real —
-            // sin el host y la ruta, un timeout de red no se distingue de un archivo corrupto.
+            // Sin respuesta del servidor: casi siempre red. El sondeo dice si el nombre no
+            // resuelve, si el puerto está cerrado, o si conecta y el problema es otro.
+            var conexion = await DatosDeConexion(rutaDestino, ct);
             monitoreo.Capturar(ex, "ftp.subir-archivo",
-                ("ftp_host", _opts.Host),
-                ("ftp_ruta", rutaDestino),
-                ("ftp_usuario", _opts.Usuario),
+            [
+                ..conexion,
                 ("archivo", nombreArchivo),
-                ("diagnostico", "No hubo respuesta del servidor FTP: revisar red, firewall o que el servicio FTP esté arriba."),
-                ("consecuencia", "documento-no-subido"));
+                ("consecuencia", "documento-no-subido")
+            ]);
             monitoreo.AgregarDato("archivo_bytes", bytes.Length);
 
             log.LogError(ex, "Error FTP subiendo {Archivo}", nombreArchivo);
@@ -118,33 +141,29 @@ public sealed class FtpDocumentService(
         }
     }
 
-    /// <summary>
-    /// Reporta el rechazo de login como fallo CRÍTICO: si el FTP no deja entrar, no se almacena
-    /// ningún documento de ninguna póliza ni siniestro, no es el problema de un archivo.
-    /// </summary>
-    private void ReportarRechazoDeLogin(
-        string codigo, string respuesta, string rutaDestino, string nombreArchivo, Exception ex)
+    private async Task ReportarRechazoDeLoginAsync(
+        FtpAuthenticationException ex, string rutaDestino, string nombreArchivo, CancellationToken ct)
     {
-        string diagnostico = DiagnosticarFtp(codigo, respuesta, rutaDestino);
+        var conexion = await DatosDeConexion(rutaDestino, ct);
+        string diagnostico = DiagnosticarFtp(ex.CompletionCode, ex.Message, rutaDestino);
 
         monitoreo.ReportarFalloCritico("ftp.login",
-            $"El FTP rechazó el acceso: {codigo} {respuesta}",
+            $"El FTP rechazó el acceso: {ex.CompletionCode} {ex.Message}",
             "ningun-documento-se-puede-almacenar",
-            ("ftp_host", _opts.Host),
-            ("ftp_usuario", _opts.Usuario),
-            ("ftp_ruta", rutaDestino),
-            ("ftp_codigo", codigo),
-            ("ftp_respuesta", respuesta),
-            ("diagnostico", diagnostico),
-            ("archivo", nombreArchivo));
+            [
+                ..conexion,
+                ("ftp_codigo", ex.CompletionCode),
+                ("ftp_respuesta", ex.Message),
+                ("diagnostico", diagnostico),
+                ("archivo", nombreArchivo)
+            ]);
 
-        monitoreo.Capturar(ex, "ftp.login",
-            ("ftp_codigo", codigo),
-            ("diagnostico", diagnostico));
+        monitoreo.Capturar(ex, "ftp.login", ("ftp_codigo", ex.CompletionCode), ("diagnostico", diagnostico));
 
-        log.LogError(ex, "FTP rechazó el login de {Usuario} en {Host} ({Codigo} {Respuesta}). {Diagnostico}",
-            _opts.Usuario, _opts.Host, codigo, respuesta, diagnostico);
+        log.LogError(ex, "FTP rechazó el login de {Usuario} en {Host}:{Puerto} ({Codigo} {Respuesta}). {Diagnostico}",
+            _opts.Usuario, _opts.Host, PuertoControlFtp, ex.CompletionCode, ex.Message, diagnostico);
     }
+
 
     /// <summary>
     /// Traduce la respuesta del servidor FTP a la causa concreta y a lo que hay que pedirle al

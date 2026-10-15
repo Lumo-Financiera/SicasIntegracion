@@ -347,13 +347,20 @@ public sealed class ProcesarLoteSeguroHandler(
             // documentos y volver a pedírselos a SICAS duplicaría el tráfico sin ganar nada.
             var descargados = new List<DocumentoDescargado>();
 
-            foreach (var archivo in archivos.Where(a => !string.IsNullOrEmpty(a.PathWWW)))
+            // El contenido se pide en bloque para toda la póliza: si la descarga directa no está
+            // disponible —en producción el host de los documentos no resuelve— el respaldo por API
+            // trae todos los archivos de la entidad en una sola respuesta, y pedirlo archivo por
+            // archivo multiplicaría ese costo.
+            var pendientes = archivos.Where(a => !string.IsNullOrEmpty(a.PathWWW)).ToList();
+            var contenidos = await sicasRestClient.ObtenerContenidos("H02", idDocto, pendientes, ct);
+
+            foreach (var archivo in pendientes)
             {
                 try
                 {
                 _documentosIntentados++;
 
-                var bytes = await sicasRestClient.DownloadFile(archivo.PathWWW!, ct);
+                contenidos.TryGetValue(archivo.NombreArchivo, out var bytes);
                 if (bytes is null || bytes.Length == 0)
                 {
                     log.LogWarning("No se pudo descargar el documento {Archivo} de la póliza {Poliza}.",

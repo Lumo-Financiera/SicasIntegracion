@@ -609,6 +609,136 @@ bien por `siniestroId`; solo el de seguros estaba roto.
   verificación fue estática (compila sin advertencias) y por lectura del contrato legacy. **La
   validación end-to-end está pendiente.**
 
+## Diagnóstico de conectividad: qué host, qué puerto, qué IP (15/10/2026)
+
+Quien opera el integrador no entra al servidor y **no puede dar por hecho que la configuración
+publicada sea la de su copia local**. Hasta ahora, ante un fallo había que adivinar a qué destino
+estaba apuntando realmente el proceso. `IDiagnosticoRed` lo mide desde el propio servidor:
+resuelve el nombre, abre un socket al puerto y nada más — justo lo necesario para separar las tres
+causas que se confundían entre sí:
+
+| Síntoma | Qué significa | A quién se le pide |
+|---|---|---|
+| `DNS: NO RESUELVE` | el servidor no traduce el nombre a IP | soporte / redes |
+| `TCP: BLOQUEADO` | resuelve pero el puerto no acepta | firewall |
+| `TCP: OK` y aun así falla | no es red: credenciales, permisos o la app remota | el dueño del sistema remoto |
+
+**`DiagnosticoConectividadBackgroundService`** corre 20 s después de cada arranque y sondea los
+cuatro destinos. Si todos responden deja solo un rastro; si alguno falla emite
+`diagnostico.conectividad` como **crítico** con la configuración efectiva y un campo
+`que_pedir_a_soporte` redactado para copiarse en un ticket. Ejemplo real del texto que genera:
+
+> El servidor NO resuelve el nombre 'www.sicasonline.info'. PEDIR A SOPORTE: habilitar la
+> resolución DNS de 'www.sicasonline.info' desde este servidor (o agregarlo al archivo hosts).
+
+> El nombre '10.100.102.6' sí resuelve (10.100.102.6) pero el puerto 21 no acepta conexión.
+> PEDIR A SOPORTE: abrir la salida TCP del servidor hacia 10.100.102.6:21.
+
+Los mismos datos (`red_host`, `red_puerto`, `red_dns`, `red_tcp`, `red_resumen`, `red_que_pedir`)
+se adjuntan ahora a los eventos de `sicas.token`, `sicas.descargar-archivo`, `ftp.login`,
+`ftp.subir-archivo` y `sfleet.acceso`. **Nunca se incluyen contraseñas**; el usuario de FTP sí,
+porque es el dato que soporte necesita para revisar permisos.
+
+Nota sobre el FTP: el sondeo mide el **puerto 21 de control**. El de datos lo negocia el modo
+pasivo y es un **rango**, que es el bloqueo más común y el menos obvio — el login funciona y la
+transferencia se queda colgada. Si el login entra pero las subidas fallan, hay que pedir
+explícitamente el rango de puertos pasivos.
+
+### Fleet: autentica pero no autoriza
+
+`sfleet.acceso` es el evento nuevo para el caso medido: `POST /authentications` devuelve 200 con un
+JWT válido y **todos** los endpoints responden 401. Como `BuscarVehiculo` es la primera llamada de
+la sincronización, se corta ahí y ni pólizas ni documentos llegan a Fleet — que es exactamente lo
+que reportan los usuarios al no ver los archivos. Se emite una sola vez por corrida y, cuando la red
+está bien, el texto lo dice sin rodeos: no es red ni contraseña, hay que pedirle al proveedor de
+Fleet que habilite los permisos de API de la cuenta sobre `client_cars`, `request_insurances` e
+`insurers`.
+
+## ⚠️ CAUSA RAÍZ de que los documentos no lleguen: SICAS publica los archivos en OTRO host (15/10/2026)
+
+Tras desplegar la rama `archivos-digitales-sicas`, Sentry reportó desde producción:
+
+```
+SICAS-INTEGRACION-22 · 14/10/2026 15:37 · ETL Siniestros (intervalo)
+System.Net.Http.HttpRequestException: Host desconocido. (www.sicasonline.info:443)
+  en SICASRestClient.DownloadFile
+```
+
+Ahí está todo. **La API y los archivos viven en nombres distintos:**
+
+| Qué | Host | ¿Lo resuelve producción? |
+|---|---|---|
+| API REST (token, ReadData, GetFiles) | `security-services.sicasonline.info` | **Sí** |
+| Archivos (`PathWWW` que devuelve GetFiles) | `www.sicasonline.info` | **No** |
+
+Los tres nombres (`security-services.`, `www.`, y el dominio pelado) resuelven a la **misma IP,
+201.150.37.147** — es el mismo servidor. El de producción solo tiene resuelto uno. Por eso el ETL
+sincroniza pólizas, siniestros, estatus y bitácora sin problema, y **ni un solo documento**: todo lo
+demás viaja por la API; los archivos eran lo único que salía por el otro nombre.
+
+Esto explica también por qué nunca apareció un evento `ftp.login`: la cadena se rompe en la
+descarga, **antes** de llegar al FTP. La pregunta de si el FTP de producción funciona sigue sin
+responderse, y se responderá sola en el primer despliegue con esta corrección.
+
+### La corrección: traer el archivo por la propia API
+
+`GetFiles` con **`URLSecurity=1`** devuelve el archivo completo en **base64 dentro de `PathWWW`**,
+por el host que producción sí resuelve. Verificado contra SICAS real el 15/10/2026 con el siniestro
+35635 (`1-202-2026-R-7234`): los tres PDF decodifican con cabecera `%PDF-` y tamaños idénticos a los
+que muestra el Centro Digital en pantalla.
+
+| Archivo | Centro Digital | Vía API (base64) |
+|---|---|---|
+| `DUA 1-202-2026-M-2373.pdf` | 510.3 KB | 510,260 bytes |
+| `FOTOGRAFIAS 1-202-2026-M-2373.pdf` | 15.1 MB | 15,055,059 bytes |
+| `ODA 1-202-2026-M-2373.pdf` | 202.9 KB | 202,913 bytes |
+
+`ISICASRestClient.ObtenerContenidos` implementa la estrategia: intenta la **descarga directa** y, en
+cuanto una falla **por red** (DNS, conexión, timeout —no un 404, que es otra cosa—), marca
+`_descargaDirectaCaida` y pasa toda la corrida al **respaldo por API**. El cliente es singleton, así
+que la decisión dura lo que el servicio y se reevalúa en cada reinicio: si corrigen el DNS, vuelve
+solo al camino rápido sin tocar código.
+
+Probado reproduciendo el fallo (URL apuntada a un host inexistente): recuperó **3 de 3** archivos en
+42.6 s. El costo del respaldo es real: trae **todos** los archivos de la entidad en una sola
+respuesta, y un siniestro con fotos pesa ~15 MB.
+
+### `URLSecurity`, los tres modos
+
+| Valor | Qué devuelve en `PathWWW` |
+|---|---|
+| `0` | URL directa en `www.sicasonline.info` (lo que se usaba) |
+| `1` | **El archivo completo en base64** |
+| `2` | Un identificador cifrado, no utilizable directamente |
+
+### Bug latente corregido de paso
+
+`ArchivoSICAS.NombreArchivo` deducía el nombre partiendo `PathWWW` por `/`. Con `URLSecurity=1` ese
+campo trae base64, así que el "nombre" habría sido un trozo del contenido. Ahora el nombre sale de
+`FileName` + `Ext`, que SICAS siempre entrega, y el parseo de la URL queda solo como respaldo. El
+resultado es idéntico al anterior para los datos ya migrados, así que no rompe el deduplicado.
+
+### El token sin reintentos tumbaba la pasada completa
+
+```
+SICAS-INTEGRACION-1R · 13/10/2026 13:29 · Sincronización documental (al arrancar)
+[sicas.token] SICAS no entregó token: respondió 500 (InternalServerError)
+consecuencia = ningun-registro-se-sincroniza-desde-sicas
+```
+
+`EnsureToken` se rendía al primer intento. Un solo 500 transitorio dejaba la corrida entera sin
+token. **No es un incidente aislado**: el 15/10/2026 se reprodujo en vivo —cuatro 500 seguidos en
+14 s— y el token salió bien poco después. Ahora reintenta 5 veces con esperas de 3, 8, 20 y 45 s
+(~76 s en total). En un proceso nocturno esa espera no le cuesta nada a nadie; perder la corrida sí.
+
+### Señal nueva en Sentry
+
+Se separó el fallo de **descarga** del de **almacenamiento**, porque el responsable es distinto: uno
+se le pide al administrador de red o a SICAS, el otro al del FTP. Si ninguna descarga de la corrida
+funciona, ahora sale `siniestros.descargar-documentos` como **crítico**, con un `diagnostico` que
+dice exactamente qué pedir: que el servidor resuelva `www.sicasonline.info`, o que SICAS confirme
+`URLSecurity=1` para esta licencia.
+
 ## Siniestros: los documentos solo se miraban una vez (13/10/2026)
 
 Reporte de operaciones sobre el siniestro `1-202-2026-R-7234`: "no hay nada cargado, fotos de los

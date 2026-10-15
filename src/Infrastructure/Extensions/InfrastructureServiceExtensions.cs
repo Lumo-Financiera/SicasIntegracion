@@ -1,6 +1,7 @@
 using LumoSys.Integraciones.Domain.Seguros.Interfaces;
 using LumoSys.Integraciones.Domain.Shared.Interfaces;
 using LumoSys.Integraciones.Domain.Siniestros.Interfaces;
+using LumoSys.Integraciones.Infrastructure.Diagnostics;
 using LumoSys.Integraciones.Infrastructure.Documents;
 using LumoSys.Integraciones.Infrastructure.Monitoring;
 using LumoSys.Integraciones.Infrastructure.Notifications;
@@ -50,6 +51,10 @@ public static class InfrastructureServiceExtensions
         // de trabajo lo da el ámbito (PushScope), no la instancia. La inicialización del SDK
         // ocurre en el arranque de la API (SentryStartupExtensions.ConfigurarSentry); si no hay
         // DSN configurado, estas implementaciones quedan como no-op y el ETL corre igual.
+        // Sondeo de red: lo consumen los manejadores de error para adjuntar al evento el host,
+        // puerto e IP reales a los que este servidor intentó conectarse.
+        services.AddSingleton<IDiagnosticoRed, DiagnosticoRed>();
+
         services.AddSingleton<IMonitoreoErrores, SentryMonitoreoErrores>();
         services.AddSingleton<IMonitoreoEtl, SentryMonitoreoEtl>();
 

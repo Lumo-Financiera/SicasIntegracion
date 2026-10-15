@@ -67,6 +67,9 @@ try
     // Puesta al día de documentos en cada arranque: es lo que hace que un despliegue sincronice
     // por sí solo todo lo que haya quedado atrás, sin tocar el servidor (ver el servicio).
     builder.Services.AddHostedService<SincronizacionDocumentalBackgroundService>();
+    // Mide al arrancar si los destinos externos se alcanzan DESDE EL SERVIDOR y lo deja en Sentry,
+    // para no tener que suponer que la configuración publicada es la local.
+    builder.Services.AddHostedService<DiagnosticoConectividadBackgroundService>();
 
     // ── Controllers ────────────────────────────────────────────────────────────
     // El filtro de monitoreo es global a propósito: etiqueta cada petición con su controlador,

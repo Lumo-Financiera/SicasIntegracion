@@ -31,19 +31,22 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
     private readonly string _contrasena;
     private readonly ILogger<SICASRestClient> _log;
     private readonly IMonitoreoErrores _monitoreo;
+    private readonly IDiagnosticoRed _diagnosticoRed;
 
     private string? _token;
     private DateTime _tokenExpira = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     public SICASRestClient(
-        IOptions<SICASOptions> opts, IMonitoreoErrores monitoreo, ILogger<SICASRestClient> log)
+        IOptions<SICASOptions> opts, IMonitoreoErrores monitoreo,
+        IDiagnosticoRed diagnosticoRed, ILogger<SICASRestClient> log)
     {
         _baseUrl    = opts.Value.BaseUrl.TrimEnd('/');
         _usuario    = opts.Value.Usuario;
         _contrasena = opts.Value.Contrasena;
         _log        = log;
         _monitoreo  = monitoreo;
+        _diagnosticoRed = diagnosticoRed;
         _http       = new RestClient(opts.Value.BaseUrl);
     }
 
@@ -68,21 +71,73 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
             string url = $"{_baseUrl}/Security/GetToken" +
                 $"?sUserName={Uri.EscapeDataString(_usuario)}&sPassword={Uri.EscapeDataString(_contrasena)}";
 
-            using var resp = await _authHttp.PostAsync(url, new StringContent(string.Empty), ct);
-            if (!resp.IsSuccessStatusCode)
+            // Se reintenta igual que el resto de las llamadas. No tenerlo costó una pasada
+            // completa: el 13/10/2026 SICAS devolvió un 500 al pedir el token justo al arrancar la
+            // sincronización documental y, como se salía al primer intento, TODA la corrida se
+            // quedó sin token y sin sincronizar un solo documento (SICAS-INTEGRACION-1R).
+            // Las esperas son largas a propósito. Los 500 de SICAS vienen en rachas: el 15/10/2026
+            // se reprodujo en vivo cuatro veces seguidas en 14 s y el token salió bien poco
+            // después. Rendirse rápido no ahorra nada —sin token la corrida entera se pierde— y
+            // esperar hasta ~75 s en un proceso nocturno no le cuesta nada a nadie.
+            TimeSpan[] esperas = [TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(8),
+                                  TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(45)];
+            int maxIntentos = esperas.Length + 1;
+
+            HttpResponseMessage? resp = null;
+            for (int intento = 1; intento <= maxIntentos; intento++)
             {
+                try
+                {
+                    resp?.Dispose();
+                    resp = await _authHttp.PostAsync(url, new StringContent(string.Empty), ct);
+
+                    if (resp.IsSuccessStatusCode || !EsTransitorioToken(resp.StatusCode) || intento == maxIntentos)
+                        break;
+
+                    TimeSpan espera = esperas[intento - 1];
+                    _log.LogWarning("SICAS respondió {Status} al pedir token (intento {Intento}/{Max}); se reintenta en {Segundos}s",
+                        resp.StatusCode, intento, maxIntentos, espera.TotalSeconds);
+                    await Task.Delay(espera, ct);
+                }
+                catch (Exception ex) when (intento < maxIntentos && !ct.IsCancellationRequested && EsFalloDeRed(ex))
+                {
+                    TimeSpan espera = esperas[intento - 1];
+                    _log.LogWarning(ex, "Se cortó la conexión al pedir token (intento {Intento}/{Max}); se reintenta en {Segundos}s",
+                        intento, maxIntentos, espera.TotalSeconds);
+                    await Task.Delay(espera, ct);
+                }
+            }
+
+            if (resp is null || !resp.IsSuccessStatusCode)
+            {
+                // Se adjunta el sondeo del host REAL al que este servidor está apuntando: ante un
+                // 500 hay que poder distinguir "SICAS está mal" de "este servidor no llega a SICAS",
+                // y quien revisa el evento no necesariamente tiene la configuración de producción.
+                var red = await _diagnosticoRed.SondearUrl("SICAS · API", _baseUrl, ct);
                 // Critico: sin token no se puede hacer NINGUNA consulta a SICAS, asi que no se
                 // sincroniza ni un registro. El log baja a Warning para no emitir un segundo
                 // evento del mismo fallo a traves del puente de ILogger.
-                _log.LogWarning("No se pudo obtener token SICAS: {Status}", resp.StatusCode);
+                string estado = resp is null ? "sin respuesta" : $"{(int)resp.StatusCode} ({resp.StatusCode})";
+                _log.LogWarning("No se pudo obtener token SICAS tras {Max} intentos: {Estado}", maxIntentos, estado);
                 _monitoreo.ReportarFalloCritico("sicas.token",
-                    $"SICAS no entregó token: respondió {(int)resp.StatusCode} ({resp.StatusCode})",
+                    $"SICAS no entregó token tras {maxIntentos} intentos: respondió {estado}",
                     "ningun-registro-se-sincroniza-desde-sicas",
-                    ("status", ((int)resp.StatusCode).ToString()), ("usuario", _usuario));
+                    ("status", resp is null ? "0" : ((int)resp.StatusCode).ToString()),
+                    ("intentos", maxIntentos.ToString()),
+                    ("usuario", _usuario),
+                    ("endpoint", $"{_baseUrl}/Security/GetToken"),
+                    ("red_host", red.Host),
+                    ("red_puerto", red.Puerto.ToString()),
+                    ("red_dns", red.DnsResuelve ? string.Join(", ", red.Ips) : "NO RESUELVE"),
+                    ("red_tcp", red.TcpConecta switch { true => $"OK ({red.MilisegundosTcp} ms)", false => "BLOQUEADO", _ => "no probado" }),
+                    ("red_resumen", red.Resumen),
+                    ("red_que_pedir", red.QuePedir));
+                resp?.Dispose();
                 return null;
             }
 
             string contenido = await resp.Content.ReadAsStringAsync(ct);
+            resp.Dispose();
             var json = JObject.Parse(contenido);
 
             if (json["Sucess"]?.ToObject<bool>() != true)
@@ -274,6 +329,13 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
            or TaskCanceledException
         || ex.InnerException is not null && EsFalloDeRed(ex.InnerException);
 
+    /// <summary>Lo mismo que <see cref="EsTransitorio"/>, para la llamada del token, que no pasa
+    /// por RestSharp sino por HttpClient (el endpoint exige Content-Length).</summary>
+    private static bool EsTransitorioToken(HttpStatusCode codigo) =>
+        codigo == HttpStatusCode.TooManyRequests
+        || codigo == HttpStatusCode.RequestTimeout
+        || (int)codigo is >= 500 and <= 599;
+
     private static bool EsTransitorio(RestResponse resp) =>
         resp.StatusCode == 0                                  // no hubo respuesta
         || resp.StatusCode == HttpStatusCode.TooManyRequests   // 429, el limite de tasa de SICAS
@@ -431,9 +493,217 @@ public sealed class SICASRestClient : ISICASRestClient, IDisposable
         }
     }
 
+    // ─── Obtención del contenido de los documentos ────────────────────────────
+
+    /// <summary>
+    /// Se enciende en cuanto una descarga directa falla por red (DNS, conexión, timeout). A partir
+    /// de ahí todas las descargas van por la API y se dejan de intentar URLs que ya sabemos que no
+    /// resuelven: sin esto, cada documento de cada siniestro repetiría el mismo fallo de DNS.
+    /// Es un campo de instancia y el cliente es singleton, así que la decisión dura lo que el
+    /// servicio; se reevalúa en cada reinicio, que es cuando tiene sentido volver a probar.
+    /// </summary>
+    private volatile bool _descargaDirectaCaida;
+
+    public async Task<Dictionary<string, byte[]>> ObtenerContenidos(
+        string identity, long valuePK, IReadOnlyCollection<ArchivoSICAS> archivos, CancellationToken ct = default)
+    {
+        var resultado = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        if (archivos.Count == 0) return resultado;
+
+        var faltantes = new List<ArchivoSICAS>();
+
+        if (!_descargaDirectaCaida)
+        {
+            foreach (var archivo in archivos)
+            {
+                if (ct.IsCancellationRequested) return resultado;
+
+                if (!archivo.TieneUrlDescargable)
+                {
+                    faltantes.Add(archivo);
+                    continue;
+                }
+
+                var (bytes, falloDeRed) = await DescargarDirecto(archivo.PathWWW!, ct);
+
+                if (bytes is { Length: > 0 })
+                {
+                    resultado[archivo.NombreArchivo] = bytes;
+                    continue;
+                }
+
+                faltantes.Add(archivo);
+
+                if (falloDeRed)
+                {
+                    // El host de los documentos no se puede alcanzar. No tiene sentido insistir
+                    // archivo por archivo: se marca y el resto de la corrida va por la API.
+                    _descargaDirectaCaida = true;
+                    _log.LogWarning("La descarga directa de documentos no está disponible; se usará el contenido que entrega la API de SICAS.");
+                    faltantes.AddRange(archivos.Where(a => a != archivo && !resultado.ContainsKey(a.NombreArchivo) && !faltantes.Contains(a)));
+                    break;
+                }
+            }
+        }
+        else
+        {
+            faltantes.AddRange(archivos);
+        }
+
+        if (faltantes.Count == 0 || ct.IsCancellationRequested)
+            return resultado;
+
+        foreach (var (nombre, contenido) in await DescargarPorApi(identity, valuePK, ct))
+        {
+            if (faltantes.Any(f => string.Equals(f.NombreArchivo, nombre, StringComparison.OrdinalIgnoreCase)))
+                resultado[nombre] = contenido;
+        }
+
+        return resultado;
+    }
+
+    /// <summary>
+    /// Descarga por URL. Devuelve también si el fallo fue de RED —DNS, conexión, timeout—, que es
+    /// lo que distingue "este archivo no está" de "este host no se puede alcanzar"; solo lo
+    /// segundo justifica cambiar de estrategia para toda la corrida.
+    /// </summary>
+    private async Task<(byte[]? Bytes, bool FalloDeRed)> DescargarDirecto(string fileUrl, CancellationToken ct)
+    {
+        try
+        {
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            var resp = await httpClient.GetAsync(fileUrl, ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _log.LogWarning("DownloadFile {Url} → {Status}", fileUrl, resp.StatusCode);
+                return (null, false);
+            }
+
+            return (await resp.Content.ReadAsByteArrayAsync(ct), false);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            bool esRed = EsFalloDeRed(ex);
+            _log.LogWarning(ex, "Falló la descarga directa de {Url}", fileUrl);
+
+            if (esRed && !_descargaDirectaCaida)
+            {
+                // Se reporta UNA vez por corrida, la primera: es el evento que le dice a soporte
+                // qué nombre y qué puerto habilitar. SICAS publica los archivos en un host
+                // DISTINTO al de la API, y ése es el que no resuelve en producción.
+                var sondeo = await _diagnosticoRed.SondearUrl("SICAS · host de los ARCHIVOS", fileUrl, ct);
+
+                _monitoreo.ReportarFalloCritico("sicas.descargar-archivo",
+                    $"No se alcanza el host donde SICAS publica los documentos: {sondeo.Host}:{sondeo.Puerto}",
+                    "ningun-documento-se-descarga-por-url-se-usara-el-respaldo-por-api",
+                    ("archivo_url", fileUrl),
+                    ("red_host", sondeo.Host),
+                    ("red_puerto", sondeo.Puerto.ToString()),
+                    ("red_dns", sondeo.DnsResuelve ? string.Join(", ", sondeo.Ips) : "NO RESUELVE"),
+                    ("red_tcp", sondeo.TcpConecta switch { true => $"OK ({sondeo.MilisegundosTcp} ms)", false => "BLOQUEADO", _ => "no probado" }),
+                    ("red_resumen", sondeo.Resumen),
+                    ("red_que_pedir", sondeo.QuePedir),
+                    ("nota", $"Este host NO es el de la API ({_baseUrl}). Ambos nombres suelen apuntar al mismo servidor, " +
+                             "pero hay que habilitarlos por separado. Mientras tanto el integrador usa el respaldo por API, que es más lento."));
+            }
+
+            return (null, esRed);
+        }
+    }
+
+    /// <summary>
+    /// Pide los archivos de la entidad con <c>URLSecurity=1</c>: SICAS los devuelve completos en
+    /// base64 dentro del propio JSON, por el host de la API. Es más caro que la descarga directa
+    /// —trae todos los archivos de la entidad, no solo el que falta, y un siniestro con fotos puede
+    /// pesar 15 MB—, por eso solo se usa como respaldo.
+    /// </summary>
+    private async Task<Dictionary<string, byte[]>> DescargarPorApi(
+        string identity, long valuePK, CancellationToken ct)
+    {
+        var contenidos = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+        string? token = await EnsureToken(ct);
+        if (token is null)
+        {
+            _monitoreo.RastrearFallo("sicas.descargar-archivo", "Sin token: no se pudo pedir el contenido",
+                ("identity", identity), ("valuepk", valuePK.ToString()));
+            return contenidos;
+        }
+
+        var req = new RestRequest("DigitalCenter/GetFiles", Method.Post)
+        {
+            // Generoso a propósito: medido el 15/10/2026, un siniestro con 3 archivos (15.7 MB en
+            // total) tardó 28.5 s en volver. El valor por omisión de RestSharp se queda corto.
+            Timeout = TimeSpan.FromMinutes(10)
+        };
+        req.AddHeader("Authorization", token);
+        req.AddJsonBody(new
+        {
+            FolderRead = 1,
+            Identity = identity,
+            ValuePK = valuePK,
+            TypeReadBasic = true,
+            ReadRecursive = false,
+            URLSecurity = 1 // el contenido viaja en base64 dentro de PathWWW
+        });
+
+        var resp = await EjecutarConReintentos(req, ct);
+        if (!resp.IsSuccessStatusCode || resp.Content is null)
+        {
+            _monitoreo.ReportarFalloSilencioso("sicas.descargar-archivo",
+                $"SICAS respondió {(int)resp.StatusCode} ({resp.StatusCode}) al pedir el contenido de los documentos",
+                "documentos-no-descargados",
+                ("identity", identity), ("valuepk", valuePK.ToString()),
+                ("status", ((int)resp.StatusCode).ToString()));
+            return contenidos;
+        }
+
+        try
+        {
+            var json = JObject.Parse(resp.Content);
+            if (json["Sucess"]?.ToObject<bool>() == false)
+                return contenidos;
+
+            var lista = json["ListData"]?.ToObject<List<ArchivoSICAS>>() ?? [];
+
+            foreach (var archivo in lista)
+            {
+                if (string.IsNullOrWhiteSpace(archivo.PathWWW) || archivo.TieneUrlDescargable)
+                    continue;
+
+                try
+                {
+                    byte[] bytes = Convert.FromBase64String(archivo.PathWWW);
+                    if (bytes.Length > 0)
+                        contenidos[archivo.NombreArchivo] = bytes;
+                }
+                catch (FormatException ex)
+                {
+                    // El contenido vino en un formato que no es base64. Es un archivo perdido, no
+                    // un fallo del lote: se reporta y se sigue con los demás.
+                    _monitoreo.Capturar(ex, "sicas.descargar-archivo",
+                        ("identity", identity), ("valuepk", valuePK.ToString()),
+                        ("archivo", archivo.NombreArchivo),
+                        ("consecuencia", "documento-no-descargado-contenido-ilegible"));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _monitoreo.Capturar(ex, "sicas.descargar-archivo",
+                ("identity", identity), ("valuepk", valuePK.ToString()),
+                ("consecuencia", "documentos-no-descargados"));
+            _log.LogError(ex, "Error leyendo el contenido de los documentos de {Identity}/{PK}", identity, valuePK);
+        }
+
+        return contenidos;
+    }
+
     public void Dispose()
     {
         _http.Dispose();
+        _authHttp.Dispose();
         _tokenLock.Dispose();
     }
 }

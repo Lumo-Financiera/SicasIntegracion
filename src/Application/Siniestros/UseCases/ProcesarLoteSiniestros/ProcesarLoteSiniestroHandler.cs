@@ -46,6 +46,13 @@ public sealed class ProcesarLoteSiniestroHandler(
     private const int MaxFallosFtpSeguidos = 5;
 
     /// <summary>
+    /// Documentos que no se pudieron traer de SICAS en toda la corrida. Se cuenta aparte de
+    /// <see cref="_documentosFallidos"/> porque la causa y el responsable son distintos: un fallo
+    /// de descarga es de SICAS o de la red hacia SICAS, no del almacenamiento.
+    /// </summary>
+    private int _descargasFallidas;
+
+    /// <summary>
     /// Cuántos días hacia atrás revisa la Fase 4 el Centro Digital, además de los siniestros que
     /// sigan abiertos. 90 días cubre con holgura lo que tarda un ajustador en subir el expediente
     /// —el caso medido se cerró antes de que llegaran sus archivos— y acota el recorrido: al
@@ -270,7 +277,9 @@ public sealed class ProcesarLoteSiniestroHandler(
                 ("siniestro_id", resultado.SiniestroId?.ToString()),
                 ("archivos", archivos.Count.ToString()));
 
-            await SubirDocumentos(resultado.SiniestroId!.Value, siniestro.NumReporte, archivos, ct);
+            if (siniestro.IDSiniestro.HasValue)
+                await SubirDocumentos(resultado.SiniestroId!.Value, siniestro.NumReporte,
+                    siniestro.IDSiniestro.Value, archivos, ct);
 
             log.LogInformation("Siniestro {NoReporte} procesado correctamente.", siniestro.NumReporte);
         }
@@ -296,35 +305,50 @@ public sealed class ProcesarLoteSiniestroHandler(
     /// Devuelve cuántos quedaron guardados en esta pasada (0 si ya estaban todos o si fallaron).
     /// </summary>
     private async Task<int> SubirDocumentos(
-        int siniestroId, string noReporte, List<ArchivoSICAS> archivos, CancellationToken ct)
+        int siniestroId, string noReporte, long idSiniestroSicas,
+        List<ArchivoSICAS> archivos, CancellationToken ct)
     {
         int guardados = 0;
 
+        // Primero se decide QUÉ falta, y solo después se pide el contenido. Así un siniestro ya
+        // completo no gasta ni una descarga, y cuando hay que recurrir al respaldo por API —que
+        // trae todos los archivos de la entidad en una sola respuesta— se paga una vez, no una
+        // por archivo.
+        var pendientes = new List<ArchivoSICAS>();
         foreach (var archivo in archivos.Where(a => !string.IsNullOrEmpty(a.PathWWW)))
+        {
+            string nombreBase = Path.GetFileNameWithoutExtension(archivo.NombreArchivo);
+            if (!await siniestroRepo.ExisteDocumentoAsync(siniestroId, nombreBase, ct))
+                pendientes.Add(archivo);
+        }
+
+        if (pendientes.Count == 0)
+            return 0;
+
+        // El corte va ANTES de la descarga: lo que se quiere ahorrar es traer de SICAS archivos
+        // que no hay dónde guardar.
+        if (_almacenamientoDescartado)
+        {
+            _documentosIntentados += pendientes.Count;
+            _documentosFallidos   += pendientes.Count;
+            return 0;
+        }
+
+        var contenidos = await sicasRestClient.ObtenerContenidos(
+            "H04", idSiniestroSicas, pendientes, ct);
+
+        foreach (var archivo in pendientes)
         {
             try
             {
-            string nombreBase = Path.GetFileNameWithoutExtension(archivo.NombreArchivo);
-            if (await siniestroRepo.ExisteDocumentoAsync(siniestroId, nombreBase, ct))
-                continue;
-
-            // El corte va ANTES de la descarga: lo que se quiere ahorrar es traer de SICAS un
-            // archivo que no hay dónde guardar.
-            if (_almacenamientoDescartado)
-            {
-                _documentosIntentados++;
-                _documentosFallidos++;
-                continue;
-            }
-
             _documentosIntentados++;
 
-            var bytes = await sicasRestClient.DownloadFile(archivo.PathWWW!, ct);
-            if (bytes is null || bytes.Length == 0)
+            if (!contenidos.TryGetValue(archivo.NombreArchivo, out var bytes) || bytes.Length == 0)
             {
                 log.LogWarning("No se pudo descargar el documento {Archivo} del siniestro {NoReporte}.",
                     archivo.NombreArchivo, noReporte);
                 _documentosFallidos++;
+                _descargasFallidas++;
                 monitoreo.RastrearFallo("siniestros.subir-documentos",
                     $"No se pudo descargar de SICAS el documento {archivo.NombreArchivo}",
                     ("folio_siniestro", noReporte));
@@ -400,6 +424,26 @@ public sealed class ProcesarLoteSiniestroHandler(
     /// </summary>
     private void ReportarResumenDocumentos()
     {
+        // Se separa el fallo de DESCARGA del de ALMACENAMIENTO porque el responsable es distinto:
+        // uno se le pide al administrador de red o a SICAS, el otro al administrador del FTP.
+        // Mezclarlos fue justo lo que hizo que el 14/10/2026 el "Host desconocido" de
+        // www.sicasonline.info se leyera como un problema de documentos sueltos.
+        if (_descargasFallidas > 0 && _descargasFallidas == _documentosIntentados)
+        {
+            monitoreo.ReportarFalloCritico("siniestros.descargar-documentos",
+                $"No se pudo descargar de SICAS ninguno de los {_documentosIntentados} documentos de la corrida",
+                "ningun-documento-llego-a-lumosys-el-origen-no-entrega-los-archivos",
+                ("descargas_fallidas", _descargasFallidas.ToString()),
+                ("documentos_intentados", _documentosIntentados.ToString()),
+                ("diagnostico",
+                 "Ni la descarga directa ni el respaldo por API entregaron contenido. PEDIR: (1) que el " +
+                 "servidor resuelva y alcance www.sicasonline.info (mismo servidor que la API, IP 201.150.37.147), " +
+                 "y (2) confirmar con SICAS que GetFiles con URLSecurity=1 devuelve el contenido para esta licencia."));
+
+            log.LogError("Descarga de documentos: fallaron las {N} de la corrida. Ni URL directa ni respaldo por API.",
+                _descargasFallidas);
+        }
+
         if (_documentosFallidos == 0) return;
 
         string motivo = $"{_documentosFallidos} de {_documentosIntentados} documentos de siniestro no se pudieron almacenar";
@@ -791,7 +835,7 @@ public sealed class ProcesarLoteSiniestroHandler(
                     }
 
                     int guardados = await SubirDocumentos(
-                        candidato.SiniestroId, candidato.NoReporte, archivos, ct);
+                        candidato.SiniestroId, candidato.NoReporte, candidato.FolioSicas, archivos, ct);
 
                     if (guardados > 0)
                     {
