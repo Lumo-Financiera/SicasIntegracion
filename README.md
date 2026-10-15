@@ -17,6 +17,7 @@ Proyecto unificado que fusiona tres proyectos anteriores:
 - **FluentFTP** — subida de documentos al servidor FTP
 - **Sin autenticación** — servicio interno de red local, sin JWT ni `[Authorize]`
 - **Swashbuckle** — documentación Swagger
+- **Sentry** — monitoreo de errores, APM y monitores de corridas programadas (ver "Monitoreo")
 
 ## Arquitectura
 
@@ -30,7 +31,7 @@ src/
 
 ## Configuración inicial
 
-1. Copiar `src/API/appsettings.json` y reemplazar todos los valores `PLACEHOLDER`.
+1. Copiar `src/API/appsettings.example.json` a `src/API/appsettings.json` y reemplazar todos los valores `PLACEHOLDER`. `appsettings.json` está en `.gitignore`: es el archivo que la app lee de verdad y no debe versionarse, porque es donde terminan las credenciales reales. La plantilla `appsettings.example.json` es la referencia de qué claves existen.
 2. Completar credenciales:
    - `ConnectionStrings:LumoSys`
    - `SICAS:Usuario` / `SICAS:Contrasena` — autenticación básica REST (no ApiKey)
@@ -109,6 +110,27 @@ Cada archivo se guarda con el nombre `{ARC_ID}.pdf` (ID real de `ARCHIVOS_REPOSI
 | `POST` | `/api/Etl/Seguros/Procesar` | Dispara ETL de seguros |
 | `POST` | `/api/Etl/Siniestros/Procesar` | Dispara ETL de siniestros |
 
+## Monitoreo (Sentry)
+
+El servicio reporta a Sentry con el mismo patrón que `lumo-system`. Configuración en `appsettings.json`, sección `Sentry` (el detalle completo está en `CLAUDE.md`, sección "Monitoreo con Sentry"):
+
+| Clave | Para qué |
+|---|---|
+| `Sentry:Dsn` | Proyecto destino. **Vacío deja el monitoreo apagado** y el ETL corre igual |
+| `Sentry:TracesSampleRate` | Muestreo de APM del tráfico HTTP (`0.2` en producción, `0.8` en Development) |
+| `Sentry:Environment` / `Sentry:Release` | Opcionales; si faltan se derivan del ambiente y de la versión del ensamblado |
+| `Sentry:Debug` | Imprime el log del propio SDK en consola — para diagnosticar la integración |
+| `Sentry:Excludes` | Rutas extra a excluir del APM, separadas por coma |
+
+Qué queda cubierto:
+
+- **Errores** — excepciones no controladas de la API, del proceso (`AppDomain`) y de tareas en segundo plano, más todo `LogError` existente del ETL. Cada evento trae el contexto de negocio como etiquetas (`modulo`, `poliza`, `serie`, `folio_siniestro`, `disparador`, …).
+- **Fallos silenciados** — los casos donde el ETL continúa a propósito (una póliza con datos malos, SFleet caído, un documento que no se pudo subir) ahora se reportan con una etiqueta `consecuencia` que dice qué quedó pendiente, en lugar de solo quedar en el log.
+- **Corridas programadas** — los cuatro barridos del ETL emiten check-ins a monitores de Sentry Crons (`etl-seguros-diario`, `etl-siniestros-diario`, `etl-seguros-intervalo`, `etl-siniestros-intervalo`). **Esto es lo que avisa cuando el servicio de Windows está detenido**: un servicio caído no genera errores ni logs, solo silencio, y el check-in ausente es la única señal que lo delata.
+- **Rendimiento** — la duración de cada corrida del ETL se rastrea al 100% en Sentry Performance.
+
+Un reinicio o despliegue no genera alertas: las cancelaciones del apagado se descartan y los check-ins de ese ciclo se cierran como cancelados, no como fallo.
+
 ## Despliegue en producción (servicio de Windows)
 
 La app corre como servicio de Windows continuo (no bajo IIS — evita el idle-timeout/reciclado de App Pool, que interrumpiría los `BackgroundServices` del ETL programado).
@@ -130,6 +152,8 @@ La app corre como servicio de Windows continuo (no bajo IIS — evita el idle-ti
    ```
 
 4. **Verificar**: `sc query LumoSysIntegraciones` → `RUNNING`, y revisar `C:\LumoSys\Programas\Sicas\Log dd-MM-yyyy.txt` (log diario de avisos/errores) o `LOG_ERRORES` en `dbLumoSys`.
+
+5. **Confirmar el monitoreo**: tras la primera corrida programada, los monitores `etl-seguros-diario` y `etl-siniestros-diario` deben aparecer en Sentry (Crons) con un check-in correcto. Si no aparecen, revisar que `Sentry:Dsn` esté configurado en el `appsettings` del servidor y que el servidor tenga salida HTTPS hacia `ingest.us.sentry.io`.
 
 ## Mejoras respecto a los proyectos anteriores
 

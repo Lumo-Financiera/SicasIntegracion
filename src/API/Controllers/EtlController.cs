@@ -42,4 +42,37 @@ public sealed class EtlController(
         await siniestrosHandler.Handle(cmd, ct);
         return Ok(new { Estatus = true, Mensaje = "Procesamiento de siniestros completado." });
     }
+
+    /// <summary>
+    /// Sincroniza los documentos del Centro Digital de SICAS hacia LumoSys, sin tocar siniestros
+    /// ni estatus.
+    ///
+    /// Es el mismo trabajo que corre solo al arrancar el servicio; este endpoint existe para poder
+    /// repetirlo bajo demanda —por ejemplo, en cuanto se corrija el acceso al FTP— sin reiniciar.
+    ///
+    /// <paramref name="completa"/> en true recorre TODOS los siniestros vinculados a SICAS; en
+    /// false solo los que no tienen ningún documento, los abiertos y los recientes. En ninguno de
+    /// los dos modos se duplica nada: cada archivo se consulta antes contra DOCUMENTOS_SINIESTROS.
+    ///
+    /// ⚠️ Una pasada completa puede tardar más que el timeout del cliente que la invoque; si la
+    /// conexión se cierra, el proceso se corta a medias en el servidor (ver la nota operativa sobre
+    /// rangos largos en CLAUDE.md). Conviene invocarlo con un timeout de cliente generoso.
+    /// </summary>
+    [HttpPost("Siniestros/Documentos")]
+    public async Task<IActionResult> SincronizarDocumentosSiniestros(
+        [FromQuery] bool completa, CancellationToken ct)
+    {
+        await siniestrosHandler.Handle(new ProcesarLoteSiniestroCommand
+        {
+            SoloDocumentos   = true,
+            RevisionCompleta = completa
+        }, ct);
+
+        return Ok(new
+        {
+            Estatus = true,
+            Mensaje = $"Sincronización documental ({(completa ? "completa" : "incremental")}) finalizada. " +
+                      "El detalle (documentos recuperados, fallos) queda en el log y en Sentry."
+        });
+    }
 }

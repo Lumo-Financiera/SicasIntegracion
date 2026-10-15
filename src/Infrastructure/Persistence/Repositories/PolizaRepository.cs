@@ -1,13 +1,15 @@
 using System.Globalization;
 using System.Text;
+using LumoSys.Integraciones.Domain.Shared.Errores;
 using LumoSys.Integraciones.Domain.Seguros.Interfaces;
 using LumoSys.Integraciones.Domain.Seguros.Models;
+using LumoSys.Integraciones.Domain.Shared.Interfaces;
 using LumoSys.Integraciones.Infrastructure.Persistence.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace LumoSys.Integraciones.Infrastructure.Persistence.Repositories;
 
-public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
+public sealed class PolizaRepository(LumoSysContext db, IMonitoreoErrores monitoreo) : IPolizaRepository
 {
     private const int ESTATUS_VIGENTE = 177;
     private const int ESTATUS_SUSTITUCION = 497;
@@ -78,7 +80,12 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
                 : null;
 
         bool esNuevo = existente is null;
-        if (esNuevo)
+
+        // Se comprueba `existente is null` en vez de `esNuevo` para que el compilador pueda ver
+        // que después de este bloque la referencia ya no es nula. Son equivalentes, pero con la
+        // variable intermedia el análisis de nulidad se pierde y avisa de una desreferencia que
+        // en realidad no puede ocurrir.
+        if (existente is null)
         {
             existente = new SegurosDetallesModel
             {
@@ -258,12 +265,12 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
     private async Task<byte> ResolverAseguradoraIdAsync(string? aseguradora, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(aseguradora))
-            throw new InvalidOperationException("La Aseguradora es obligatoria.");
+            throw new ErrorDeNegocio("La Aseguradora es obligatoria.");
 
         string valor = aseguradora.ToUpper();
         byte? id = await db.Aseguradoras.Where(x => x.ASE_DESCRIPCION == valor).Select(x => (byte?)x.ASE_ID).FirstOrDefaultAsync(ct);
 
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Aseguradora '{aseguradora}' no se encuentra registrada en el catálogo ASEGURADORAS.");
     }
 
@@ -275,7 +282,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         string valor = formaPago.Trim();
         byte? id = await db.TiposFormasPagosSeguros.Where(x => x.TFS_DESCRIPCION == valor).Select(x => (byte?)x.TFS_ID).FirstOrDefaultAsync(ct);
 
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Forma de Pago '{formaPago}' no se encuentra registrada en el catálogo TIPOS_FORMAS_PAGOS_SEGUROS.");
     }
 
@@ -340,7 +347,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
             return null;
 
         byte? id = await db.TiposAdministracionesCartera.Where(x => x.TTC_DESCRIPCION == valor).Select(x => (byte?)x.TTC_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Administración de Cartera '{valor}' no se encuentra en el catálogo TIPOS_ADMINISTRACIONES_CARTERA.");
     }
 
@@ -351,7 +358,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
 
         string texto = valor.Trim();
         byte? id = await db.TiposUsos.Where(x => x.TUS_DESCRIPCION == texto).Select(x => (byte?)x.TUS_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Uso '{valor}' no se encuentra en el catálogo TIPOS_USOS.");
     }
 
@@ -378,7 +385,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
 
         string texto = valor.Trim();
         byte? id = await db.TiposPolizas.Where(x => x.TPZ_DESCRIPCION == texto).Select(x => (byte?)x.TPZ_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Póliza '{valor}' no se encuentra en el catálogo TIPOS_POLIZAS.");
     }
 
@@ -389,7 +396,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
 
         string texto = valor.Trim();
         byte? id = await db.TiposCoberturas.Where(x => x.TCX_DESCRIPCION == texto).Select(x => (byte?)x.TCX_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Cobertura '{valor}' no se encuentra en el catálogo TIPOS_COBERTURAS.");
     }
 
@@ -400,7 +407,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
 
         string texto = valor.Trim();
         byte? id = await db.TiposGestionPagosSeguro.Where(x => x.TGS_DESCRIPCION == texto).Select(x => (byte?)x.TGS_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"La Gestión de Pago '{valor}' no se encuentra en el catálogo TIPOS_GESTION_PAGOS_SEGURO.");
     }
 
@@ -414,7 +421,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         texto = texto.Trim();
 
         byte? id = await db.TiposValoresSeguro.Where(x => x.TVS_DESCRIPCION == texto).Select(x => (byte?)x.TVS_ID).FirstOrDefaultAsync(ct);
-        return id ?? throw new InvalidOperationException(
+        return id ?? throw new ErrorDeNegocio(
             $"El Tipo de Valor de Seguro '{valor}' no se encuentra en el catálogo TIPOS_VALORES_SEGURO.");
     }
 
@@ -429,7 +436,7 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
             .ToListAsync(ct);
 
         var match = usuarios.FirstOrDefault(x => x.Nombre.Contains(buscado));
-        return match?.USU_ID ?? throw new InvalidOperationException(
+        return match?.USU_ID ?? throw new ErrorDeNegocio(
             $"El Ejecutivo '{ejecutivo}' no se encontró registrado en el catálogo USUARIOS.");
     }
 
@@ -444,27 +451,54 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         {
             "AMPARADA" or "AMPARADO" => true,
             "NO APLICA" => false,
-            _ => throw new InvalidOperationException($"El valor de cobertura '{valor}' debe ser AMPARADA, AMPARADO o NO APLICA.")
+            _ => throw new ErrorDeNegocio($"El valor de cobertura '{valor}' debe ser AMPARADA, AMPARADO o NO APLICA.")
         };
     }
 
     // ─── Documentos ──────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// ¿Esta serie ya tiene registrado este documento de póliza?
+    ///
+    /// La versión anterior recibía <paramref name="serie"/> y no la usaba: preguntaba si
+    /// ALGUNA unidad del sistema tenía un documento de tipo 4 cuyo nombre CONTUVIERA el
+    /// texto buscado. Con los nombres genéricos que manda SICAS ("POLIZA.pdf", "1.pdf"),
+    /// el primer documento cargado para cualquier vehículo hacía que todos los demás se
+    /// descartaran como "ya existe" y nunca se subieran. Ahora se acota al vehículo real
+    /// (DUN_CDE_ID → COMPRAS_DETALLES.CDE_NO_SERIE) y se compara por igualdad.
+    /// </summary>
     public async Task<bool> ExisteDocumentoAsync(string serie, string nombreArchivo, CancellationToken ct = default)
     {
-        return await db.DocumentosUnidades
-            .Join(db.ArchivosRepositorios,
-                du => du.DUN_ARC_ID,
-                ar => ar.ARC_ID,
-                (du, ar) => new { du, ar })
-            .AnyAsync(x =>
-                x.du.DUN_TDW_ID == 4 &&
-                x.ar.ARC_NOMBRE_ARCHIVO.Contains(nombreArchivo), ct);
+        if (string.IsNullOrWhiteSpace(serie) || string.IsNullOrWhiteSpace(nombreArchivo))
+            return false;
+
+        return await (
+            from du in db.DocumentosUnidades
+            join ar in db.ArchivosRepositorios on du.DUN_ARC_ID equals ar.ARC_ID
+            join cd in db.ComprasDetalles on du.DUN_CDE_ID equals cd.CDE_ID
+            where du.DUN_TDW_ID == 4
+                  && cd.CDE_NO_SERIE == serie
+                  && ar.ARC_NOMBRE_ARCHIVO == nombreArchivo
+            select du.DUN_ID
+        ).AnyAsync(ct);
     }
 
     public async Task<int> RegistrarArchivoAsync(string nombreArchivo, long tamanoBytes, CancellationToken ct = default)
     {
         int arcId = await ObtenerSecuenciaAsync("ARC", ct);
+
+        // ARC_TMM_ID queda fijo en 2 (PDF) porque el catálogo TIPOS_MULTIMEDIA no está modelado
+        // en este proyecto y no hay forma de resolver el id real de otras extensiones sin
+        // inventarlo. SICAS entrega casi siempre PDF, pero cuando no lo hace el archivo queda
+        // etiquetado mal, así que al menos se avisa en vez de pasar en silencio.
+        string extension = Path.GetExtension(nombreArchivo);
+        if (!string.Equals(extension, ".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            monitoreo.ReportarFalloSilencioso("seguros.registrar-archivo",
+                $"El documento no es PDF ({extension}) y se registra con ARC_TMM_ID=2 de todos modos",
+                "archivo-registrado-con-tipo-multimedia-incorrecto",
+                ("archivo", nombreArchivo), ("extension", extension), ("archivo_id", arcId.ToString()));
+        }
 
         var nuevoArchivo = new ArchivosRepositoriosModel
         {
@@ -482,6 +516,25 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         return nuevoArchivo.ARC_ID;
     }
 
+    /// <summary>
+    /// Borra la fila de ARCHIVOS_REPOSITORIOS cuando la subida al FTP falló.
+    ///
+    /// El ARC_ID tiene que existir antes de subir, porque el nombre del archivo en el FTP ES el
+    /// ARC_ID. Si la subida falla y la fila se queda, el repositorio acumula registros que
+    /// apuntan a un archivo que no existe; peor aún, el reintento del día siguiente los seguiría
+    /// ignorando porque nunca se vincularon. Se deshace el registro para que el reproceso parta
+    /// de cero. El folio de la secuencia sí se consume — eso no es reversible ni importa.
+    /// </summary>
+    public async Task EliminarArchivoAsync(int archivoId, CancellationToken ct = default)
+    {
+        var archivo = await db.ArchivosRepositorios.FirstOrDefaultAsync(x => x.ARC_ID == archivoId, ct);
+        if (archivo is null)
+            return;
+
+        db.ArchivosRepositorios.Remove(archivo);
+        await db.SaveChangesAsync(ct);
+    }
+
     public async Task VincularDocumentoUnidadAsync(string serie, int archivoId, CancellationToken ct = default)
     {
         // DUN_CDE_ID y DUN_CLI_ID son NOT NULL en el esquema real y no existe un equivalente a
@@ -490,11 +543,28 @@ public sealed class PolizaRepository(LumoSysContext db) : IPolizaRepository
         // si no se puede vincular, se omite (limitación conocida del esquema, no un error).
         var compra = await db.ComprasDetalles.FirstOrDefaultAsync(x => x.CDE_NO_SERIE == serie, ct);
         if (compra is null)
+        {
+            // El PDF ya está físicamente en el FTP, pero sin fila en DOCUMENTOS_UNIDADES es
+            // invisible desde LumoSys: nadie lo va a encontrar y la fila de ARCHIVOS_REPOSITORIOS
+            // queda huérfana (ver "Pendiente/conocido" en CLAUDE.md). Salía en silencio absoluto.
+            monitoreo.ReportarFalloSilencioso("seguros.vincular-documento",
+                "No existe COMPRAS_DETALLES para la serie: el documento no se puede vincular",
+                "documento-subido-al-ftp-pero-invisible-en-lumosys",
+                ("serie", serie), ("archivo_id", archivoId.ToString()));
             return;
+        }
 
         var c = await db.Compras.FirstOrDefaultAsync(x => x.COM_ID == compra.CDE_COM_ID, ct);
         if (c?.COM_CLI_ID is not int cliId)
+        {
+            monitoreo.ReportarFalloSilencioso("seguros.vincular-documento",
+                "La compra de la serie no tiene cliente (COM_CLI_ID): el documento no se puede vincular",
+                "documento-subido-al-ftp-pero-invisible-en-lumosys",
+                ("serie", serie),
+                ("archivo_id", archivoId.ToString()),
+                ("compra_id", compra.CDE_COM_ID.ToString()));
             return;
+        }
 
         var doc = new DocumentosUnidadesModel
         {

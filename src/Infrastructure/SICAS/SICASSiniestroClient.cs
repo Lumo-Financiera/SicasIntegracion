@@ -140,6 +140,64 @@ public sealed class SICASSiniestroClient(ISICASRestClient sicas) : ISiniestroSIC
         return resp ?? [];
     }
 
+    /// <summary>
+    /// Trae un siniestro concreto por su IDSiniestro. Lo usa la reconciliacion, que parte de lo que
+    /// hay en dbLumoSys y necesita preguntarle a SICAS su estatus actual; buscar por NumReporte no
+    /// sirve ahi porque un mismo folio puede corresponder a varios siniestros distintos.
+    /// </summary>
+    public async Task<SiniestroResumenSICAS?> BuscarPorIdSiniestro(int idSiniestro, CancellationToken ct = default)
+    {
+        var resp = await sicas.ReadData<SiniestroResumenSICAS>(new SolicitudReadData
+        {
+            KeyCode     = "HDS00009",
+            Page        = 1,
+            ItemForPage = 5,
+            Conditions  =
+            [
+                new CondicionSICAS
+                {
+                    Label      = "IDSiniestro",
+                    FilterType = 0,
+                    Values     = idSiniestro.ToString(),
+                    ColumnName = "DatSiniestros.IDSiniestro"
+                }
+            ]
+        }, ct);
+
+        return resp?.FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Historial de bitacora de UN siniestro, sin depender del rango de fechas de la Fase 2.
+    ///
+    /// El prefijo de tabla en ColumnName es lo que lo hace posible: "DatSiniestros.IDSiniestro"
+    /// filtra por el siniestro, mientras que H03314011 a secas solo deja barrer por fecha. Sin
+    /// esto, reprocesar un folio suelto dejaba su historial sin tocar y traerlo obligaba a barrer
+    /// todos los siniestros del periodo.
+    /// </summary>
+    public async Task<List<SiniestroBitacoraSICAS>> BuscarBitacoraPorSiniestro(
+        int idSiniestro, CancellationToken ct = default)
+    {
+        var resp = await sicas.ReadData<SiniestroBitacoraSICAS>(new SolicitudReadData
+        {
+            KeyCode     = "H03314011",
+            Page        = 1,
+            ItemForPage = 500,
+            Conditions  =
+            [
+                new CondicionSICAS
+                {
+                    Label      = "IDSiniestro",
+                    FilterType = 0,
+                    Values     = idSiniestro.ToString(),
+                    ColumnName = "DatSiniestros.IDSiniestro"
+                }
+            ]
+        }, ct);
+
+        return resp ?? [];
+    }
+
     public Task<List<ArchivoSICAS>> BuscarDigital(long idSiniestro, CancellationToken ct = default) =>
         sicas.BuscarArchivosDigitales("H04", idSiniestro, ct);
 }

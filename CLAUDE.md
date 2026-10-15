@@ -17,6 +17,7 @@ Fusiona tres proyectos anteriores en uno solo:
 - FluentFTP 53 para subida de documentos
 - Newtonsoft.Json 13 (SICAS puede devolver JSON malformado; hay retry con JsonReaderException)
 - Swashbuckle 7 para Swagger
+- Sentry 6.10 para monitoreo/APM (`Sentry.AspNetCore` en API, `Sentry` en Infrastructure) — ver seccion "Monitoreo con Sentry"
 - **Sin autenticación** — servicio interno de red local, sin JWT, sin [Authorize] en ningún controller
 
 ## Estructura de capas (Clean Architecture)
@@ -41,7 +42,13 @@ API         — controllers (thin), background services, middleware, Program.cs.
 
 **`appsettings.json`** — versionable, solo PLACEHOLDERs. Nunca escribir credenciales aquí.
 
-**`appsettings.Local.json`** — en `.gitignore`, contiene las credenciales reales. Se carga automáticamente por `Program.cs`. Este archivo NO se versiona.
+**`appsettings.Local.json`** — en `.gitignore`, contiene las credenciales reales. Se carga automáticamente por `Program.cs`. Este archivo NO se versiona. **Confirmado que `dotnet publish` sí lo copia a la carpeta de salida**, así que poner las credenciales aquí no obliga a editar el `appsettings.json` del servidor.
+
+- ⚠️ **11/09/2026**: se detectaron credenciales reales (SQL, SICAS, SFleet, FTP) escritas directamente en `appsettings.json`, que sí se versiona — a un `git commit` de quedar en el historial para siempre. Se movieron a `appsettings.Local.json` y el versionado volvió a `PLACEHOLDER`. Si el objetivo era desplegar, el camino correcto es `appsettings.Local.json`: el publish lo copia igual y git no lo ve.
+
+- **`appsettings.json` pasó a estar en `.gitignore`** (11/09/2026), por ser el archivo que la app lee de verdad y, por tanto, donde acaban las credenciales cuando alguien las escribe a mano en el servidor. La plantilla con la lista completa de claves y sus `PLACEHOLDER` es **`appsettings.example.json`**, que sí se versiona y está excluida del publish (`Content Remove` en el csproj) para no confundirla con el archivo real en la carpeta de despliegue.
+  - ⚠️ **La regla de `.gitignore` no basta por sí sola**: `appsettings.json` ya estaba rastreado y git sigue versionando lo que ya tiene en el índice. Para que surta efecto hay que sacarlo una vez con `git rm --cached src/API/appsettings.json` (no borra el archivo del disco) y commitear esa eliminación. Mientras eso no se haga, el archivo se sigue versionando con normalidad.
+  - Al clonar el repo hay que copiar `appsettings.example.json` a `appsettings.json` y llenar los valores, o la app arranca sin configuración base (URLs, `Aplicaciones` 11/12, `EtlSchedule`, DSN de Sentry).
 
 Credenciales reales origen: `C:\Desarrollo\Programas\PROD\Integraciones\appSettings.json` y `B:\Dessaarollos\API.Lumosys\API.LumoSys\appsettings.json`.
 
@@ -70,6 +77,11 @@ EtlSchedule.Siniestros           → hora diaria del ETL de siniestros (default 
 EtlSchedule.IntervaloMinutosSeguros    → si es >0, corre cada N minutos en vez de 1 vez al día (ver nota abajo)
 EtlSchedule.IntervaloMinutosSiniestros → idem, para Siniestros
 Aplicaciones.Seguros/Siniestros  → 11 / 12
+Sentry.Dsn                       → DSN del proyecto en Sentry (vacio = monitoreo deshabilitado)
+Sentry.TracesSampleRate          → muestreo de APM (0.2 en appsettings.json, 0.8 en Development)
+Sentry.Environment/Release       → opcionales; si faltan se derivan del ambiente y del ensamblado
+Sentry.Debug                     → log del propio SDK en consola (para diagnosticar la integracion)
+Sentry.Excludes                  → rutas extra a excluir del APM, separadas por coma
 ```
 
 ## Convenciones de código
@@ -114,6 +126,42 @@ Aplicaciones.Seguros/Siniestros  → 11 / 12
 - Host `10.100.102.6`, sitio IIS FTP `FtpSicasDocumentos`, ruta física `C:\inetpub\wwwroot\LumoSys\Content\Documentos`, conecta con autenticación de paso a través (usa las credenciales del propio usuario FTP contra el sistema de archivos).
 - La cuenta de Windows `Jesus` (usada por `Ftp.Usuario`/`Ftp.Contrasena` en `appsettings.Local.json`) tenía marcado **"El usuario debe cambiar la contraseña en el siguiente inicio de sesión"**, lo cual bloquea el login FTP con `530 User cannot log in` (sin mensaje de detalle) — no hay forma de cambiar la contraseña vía FTP. Se corrigió desmarcando esa opción y marcando "La contraseña nunca expira" (para que no se repita cuando la contraseña expire).
 - Si este error vuelve a aparecer, revisar en este orden: (1) permisos NTFS de la cuenta sobre la ruta física del sitio, (2) reglas de autorización FTP (`Jesus` debe estar en la lista con Leer+Escribir), (3) autenticación FTP habilitada (básica sí, anónima no), (4) estado de la cuenta de Windows (deshabilitada/bloqueada/contraseña por cambiar).
+
+- **⚠️ Estado al 13/10/2026: el FTP está rechazando el login, con un error DISTINTO al de 2026-07.**
+  La cuenta configurada hoy en `appsettings.Local.json` ya no es `Jesus` sino **`Sicas FTP`** (con
+  espacio en el nombre), y el diálogo crudo contra `10.100.102.6:21` responde:
+
+  ```
+  220 Microsoft FTP Service
+  USER Sicas FTP   → 331 Password required
+  PASS ********    → 530 User cannot log in, home directory inaccessible.
+  ```
+
+  La coletilla `home directory inaccessible` es la parte informativa: no es "contraseña incorrecta"
+  ni "debe cambiar la contraseña" (ésos dan `530 User cannot log in.` a secas). IIS llegó a resolver
+  la cuenta y falló al abrir su directorio raíz. Con el sitio configurado en **autenticación de paso
+  a través**, IIS accede al sistema de archivos suplantando a la propia cuenta FTP, así que el
+  sospechoso número uno son los **permisos NTFS de `Sicas FTP` sobre
+  `C:\inetpub\wwwroot\LumoSys\Content\Documentos`**, y el número dos el **aislamiento de usuarios**
+  del sitio FTP. Ver la sección de diagnóstico paso a paso más abajo.
+
+  Consecuencia mientras dure: **ningún documento de póliza ni de siniestro se puede almacenar**,
+  aunque SICAS los entregue y el resto del ETL funcione.
+
+- **⚠️ Pero el FTP de PRODUCCIÓN sí funcionaba.** No hay que confundir el entorno local con el
+  servidor. Evidencia en `dbLumoSys`: se escribieron documentos de póliza el **28/09/2026** (23
+  archivos) y el 22/09/2026 (7). Es decir, dos semanas antes de este diagnóstico el flujo
+  almacenaba sin problema. El `530` de arriba se obtuvo desde una terminal de desarrollo con las
+  credenciales de `appsettings.Local.json`, que **no son necesariamente las del servidor** — el
+  publish copia ese archivo, pero en el servidor puede estar actualizado.
+
+  Conclusión operativa: **no dar por caído el FTP de producción sin un evento de Sentry que lo
+  demuestre.** Para eso `FtpDocumentService` emite ahora `ftp.login` como fallo crítico con el
+  código y la respuesta literal del servidor (ver abajo).
+
+- **Último documento escrito, por tipo** (medido 13/10/2026): pólizas 28/09/2026, siniestros
+  **18/08/2026**. Los siniestros llevan casi dos meses sin recibir nada, y no es por el FTP —las
+  pólizas siguieron entrando un mes más—: es el hueco estructural de la Fase 4 (ver su sección).
 
 ## SICAS REST
 
@@ -186,6 +234,717 @@ Además de `dbIntegraciones.Seguridad.Bitacora`, cada aviso/error que pasa por `
 
 - **Hallazgo relacionado**: el ETL legacy (`C:\Desarrollo\Programas\PROD\Integraciones`) sigue activo y programado en el servidor (genera su log diario incluso en fechas muy recientes), pero la mayoría de sus archivos diarios son mínimos (~45-175 bytes, solo "Inicio de proceso") — consistente con que también sufre el mismo bug de formato de fecha (`dd/MM/yyyy` vs ISO) que se corrigió en este proyecto, es decir, tampoco ha estado procesando nada en el día a día. Los pocos archivos grandes (ej. `Log 22-06-2026.txt`, `Log 30-06-2026.txt`) corresponden a ejecuciones manuales/reprocesamiento puntual.
 
+## Monitoreo con Sentry (07/09/2026)
+
+Integrado replicando el patrón ya probado en `lumo-system` (`slnLumoSys/Global.asax.cs`), trasladado del modelo de hosting de ASP.NET MVC/net462 al de ASP.NET Core/.NET 9.
+
+- **Paquetes**: `Sentry.AspNetCore` 6.10.0 en API, `Sentry` 6.10.0 en Infrastructure. (lumo-system usa 5.1.1 con `Sentry.AspNet` + `Sentry.EntityFramework`, que son los equivalentes de .NET Framework.)
+- **DSN**: en `appsettings.json`, sección `Sentry`. No es un secreto (viaja en cada evento), por eso va en el archivo versionado. Un DSN vacío deja el SDK deshabilitado y el ETL corre igual — todas las llamadas de monitoreo son no-op.
+- **Inicialización**: `SentryStartupExtensions.ConfigurarSentry(builder)` (`src/API/Extensions/`), llamada en `Program.cs` antes de registrar los demás servicios para que también cubra las fallas de arranque.
+
+### Abstracción por capas (por qué no se usa `SentrySdk` directo en Application)
+
+`lumo-system` es un monolito MVC sin capas y llama `SentrySdk` directo. Aquí eso acoplaría Application a un SDK de terceros, contra la misma regla que ya prohíbe EF Core y HTTP en esa capa. En su lugar hay dos puertos en `Domain/Shared/Interfaces/`:
+
+| Interfaz | Implementación | Usada por |
+|---|---|---|
+| `IMonitoreoErrores` | `Infrastructure/Monitoring/SentryMonitoreoErrores.cs` | Handlers de Application, clientes de Infrastructure, `ExceptionHandlingMiddleware` |
+| `IMonitoreoEtl` | `Infrastructure/Monitoring/SentryMonitoreoEtl.cs` | Los 4 BackgroundServices |
+
+Domain y Application no referencian el paquete `Sentry`. Ambas implementaciones son singleton: el SDK es estático por diseño y el aislamiento entre unidades de trabajo lo da el ámbito (`PushScope`, propagado por `AsyncLocal`), no la instancia.
+
+### Qué NO hace falta instrumentar a mano
+
+`MinimumEventLevel = LogLevel.Error` hace que **todo `log.LogError(...)` que ya existía se convierta en evento de Sentry**, con los parámetros estructurados del mensaje como datos extra. Por eso no se agregaron try-catch nuevos en repositorios, `SICASSeguroClient`/`SICASSiniestroClient`, `GuardarPolizaHandler`, `GuardarSiniestroHandler` ni `SubirDocumentoPolizaHandler`: ya reportan solos. Las integraciones automáticas del SDK cubren además:
+
+- `AppDomainUnhandledExceptionIntegration` — excepciones no controladas del proceso (crítico corriendo como servicio de Windows).
+- `UnobservedTaskExceptionIntegration` — excepciones de `Task` en segundo plano que nadie observa.
+- `SentryDiagnosticListenerIntegration` — instrumenta EF Core y `HttpClient` (equivale al `AddEntityFramework()` de lumo-system).
+- Middleware de request + `AutoRegisterTracing` — transacciones HTTP (equivale a `Application_BeginRequest`/`EndRequest` con `Start`/`FinishSentryTransaction`).
+
+`DeduplicateMode` se fija explícitamente a `SameEvent | SameExceptionInstance | AggregateException`: es lo que evita el evento duplicado cuando un punto de entrada reporta la excepción a mano (para adjuntar contexto) y además la loguea. Verificado en vivo — el log de debug muestra `Event dropped by processor DuplicateEventDetectionEventProcessor`.
+
+### Puntos donde sí se instrumentó, y por qué
+
+Solo dos criterios: (a) puntos de entrada del flujo, y (b) `catch` que ya silenciaban el error por regla de negocio, donde el flujo no se toca pero el fallo era invisible.
+
+| Archivo | Qué se agregó | Motivo |
+|---|---|---|
+| `SegurosEtlBackgroundService`, `SiniestrosEtlBackgroundService` y sus dos variantes de intervalo | Corrida de ETL (`IMonitoreoEtl`) por ciclo | Punto de entrada del flujo automático |
+| `ExceptionHandlingMiddleware` | `Capturar` con método/ruta/traza | Equivalente de `Application_Error`; el middleware consume la excepción, así que sin captura explícita el middleware de Sentry nunca la vería |
+| `ProcesarLoteSeguroHandler` | Ámbito por póliza + captura en `ProcesarPolizaCompleta` y `SincronizarSFleet` | Ambos `catch` silencian a propósito (un ítem malo no debe abortar el lote; SFleet caído no debe deshacer lo ya guardado) |
+| `ProcesarLoteSiniestroHandler` | Ámbito por siniestro + captura en `ProcesarSiniestroCompleto` y `ProcesarBitacoraDia` | Igual; la Fase 2 es complementaria y su fallo no debe invalidar la Fase 1 |
+| `FtpDocumentService` | Captura con host/ruta/archivo, rastros de subida | Devuelve `0` por contrato; sin host y ruta un `530 User cannot log in` no se distingue de un archivo corrupto (ver "FTP — cuenta de servicio") |
+| `SICASRestClient` | Rastros de token/ReadData, captura en `DownloadFile`, `GetFiles` y JSON irreparable | Devuelven `null`/`[]` por contrato: un documento que nunca llega es la falla más difícil de notar, porque la póliza sí queda guardada |
+| `SFleetClient` | `LogError` + rastro cuando la autenticación falla | **Antes devolvía `null` sin registrar nada**: con las credenciales caídas cada póliza salía como "serie no encontrada en SFleet" (un aviso normal) y nada indicaba que ninguna se sincronizaba |
+
+Ningún `catch` intermedio nuevo silencia nada: los cuatro puntos con captura ya silenciaban antes por decisión de negocio y conservan su comportamiento. En los BackgroundServices se agregó un `catch (OperationCanceledException)` que marca la corrida como cancelada y **re-lanza** (`throw;`) — el filtro `when (ex is not OperationCanceledException)` original tampoco la atrapaba, así que el flujo es idéntico.
+
+### Monitores programados (Sentry Crons) — lo que el log no puede detectar
+
+Cada ciclo de ETL emite un check-in (`in_progress` seguido de `ok`/`error`) contra un monitor con horario declarado desde el propio código, en `DescribirCorrida`:
+
+| Monitor | Horario | Duración máx. |
+|---|---|---|
+| `etl-seguros-diario` | crontab derivado de `EtlSchedule:Seguros` | 180 min |
+| `etl-siniestros-diario` | crontab derivado de `EtlSchedule:Siniestros` | 180 min |
+| `etl-seguros-intervalo` | cada `IntervaloMinutosSeguros` min | máx(2× intervalo, 30) min |
+| `etl-siniestros-intervalo` | cada `IntervaloMinutosSiniestros` min | máx(2× intervalo, 30) min |
+
+**Esta es la parte que resuelve un problema real ya documentado arriba**: cuando el servicio de Windows está detenido no hay excepciones ni logs, así que el silencio es indistinguible del funcionamiento normal — es exactamente cómo se perdió la póliza `L0000019660-0` (ver "ETL — modo de intervalo"). El check-in ausente es la única señal capaz de detectarlo. El horario se traduce a crontab desde la misma config que gobierna el `Task.Delay`, para que no se desincronice al cambiar `EtlSchedule`; `TimeZone` se fija a la del servidor o Sentry evaluaría los horarios nocturnos en UTC.
+
+Los slugs de monitor **no deben cambiar entre despliegues**: son la llave con la que Sentry sabe qué corrida esperaba.
+
+### Rendimiento (APM)
+
+`TracesSampler` da **1.0 a las transacciones `etl.run`** (son pocas al día y su duración es justo el dato a vigilar) y aplica la tasa configurada al tráfico HTTP, excluyendo `/swagger`, `/health` y `/favicon.ico` (más lo que se agregue en `Sentry:Excludes`, equivalente al `SENTRY_EXCLUDES` de lumo-system). `TracesSampleRate`: 0.8 en `appsettings.Development.json`, 0.2 en `appsettings.json` — mismo criterio que el `#if DEBUG` de lumo-system.
+
+`SetBeforeSend` descarta `OperationCanceledException`/`TaskCanceledException`: al detener el servicio, los `Task.Delay` de los cuatro BackgroundServices y las peticiones en vuelo las lanzan, y reportarlas convertiría cada reinicio o despliegue en una ráfaga de alertas falsas.
+
+### Etiquetas disponibles para filtrar en Sentry
+
+`servicio` (fijo, `LumoSysIntegraciones`), `modulo` (Seguros/Siniestros), `disparador` (`programado-diario`, `programado-intervalo`, `manual-poliza`, `manual-serie`, `manual-folio`), `operacion`, `monitor`, `poliza`, `iddocto`, `serie`, `folio_siniestro`, `idsiniestro`, `rango_desde`/`rango_hasta`, `ventana_minutos`, `http_metodo`/`http_ruta`, y `consecuencia` en los casos silenciados (`poliza-omitida-lote-continua`, `guardada-en-lumosys-sin-sincronizar-sfleet`, `siniestro-omitido-lote-continua`, `comentarios-de-bitacora-no-actualizados`, `documento-no-subido`, `documento-no-descargado`, entre otros) — esta última es la que dice qué quedó pendiente de arreglar a mano.
+
+### Verificación realizada
+
+Prueba de humo con `Sentry:Debug=true`: arranque y apagado limpios (DSN leído, integraciones registradas, `Disposing the Hub` al detener), y un `GET /api/Siniestros/Estado` con la BD inaccesible produjo `Capturing event`, luego la deduplicación del evento del `ILogger`, y `HttpTransport: Envelope '...' successfully sent`. La respuesta HTTP siguió siendo el mismo JSON de 500 de antes — contrato de la API sin cambios.
+
+También se validó un ciclo completo del ETL programado (con `EtlSchedule:Seguros` puesto 2 min adelante): check-in `in_progress` enviado, lote ejecutado, transacción `etl.run` enviada, check-in `ok` enviado, y el servicio siguió agendando la corrida del día siguiente sin quedar en un estado raro. El evento intermedio de ese ciclo fue el rechazo de autenticación de SICAS (`Usuario o Contraseña Incorrecta`, esperado con los `PLACEHOLDER` de este entorno) capturado **automáticamente** por la integración de `ILogger` en `SICASRestClient`, sin try-catch agregado — confirmación práctica de que el enfoque de no instrumentar lo que ya loguea funciona.
+
+**Pendientes**:
+1. Los cuatro monitores programados aparecerán en Sentry al primer check-in real de cada uno (los dos de intervalo, solo si `IntervaloMinutosX` está configurado en ese ambiente).
+2. La prueba anterior dio de alta `etl-seguros-diario` con el crontab de la hora de prueba (`21 16 * * *`). **Se corrige solo**: `ConfigurarMonitor` reenvía el horario en cada check-in, así que la primera corrida real en el servidor lo deja en el valor de `EtlSchedule:Seguros`. Si molesta antes de eso, se puede borrar el monitor en Sentry y se vuelve a crear correctamente.
+
+### Auditoría previa a producción (11/09/2026) — hallazgos y correcciones
+
+Revisión de si la integración cubría el ciclo completo del sistema. Se encontraron dos fallos que
+habrían dejado ciega la instalación justo en su modo de falla más probable, y se corrigieron.
+
+#### 1. CRÍTICO — un timeout de SICAS tumbaba el servicio y Sentry reportaba "todo bien"
+
+`HttpClient` lanza `TaskCanceledException` cuando vence su `Timeout`, y `TaskCanceledException`
+hereda de `OperationCanceledException`. Verificado en banco de pruebas: en ese caso
+`ex.CancellationToken.IsCancellationRequested` también vale `true` (lo cancela el temporizador
+interno del propio `HttpClient`), así que **el token no permite distinguir un timeout de red del
+apagado del servicio**. Lo único que los diferencia es `InnerException` (`TimeoutException` en el
+timeout, `null` en el apagado) o el estado del host.
+
+Con la versión original eso encadenaba tres efectos a la vez, todos en el mismo escenario —SICAS
+en mantenimiento o red caída:
+
+1. `SetBeforeSend` descartaba toda `OperationCanceledException` ⇒ **el error nunca llegaba a Sentry**.
+2. El `catch (OperationCanceledException)` de los cuatro BackgroundServices lo tomaba por apagado y
+   cerraba el check-in como **`Ok`** ⇒ **el monitor programado reportaba la corrida como correcta**.
+3. Ese mismo `catch` hacía `throw;` ⇒ moría el `ExecuteAsync`, y con
+   `BackgroundServiceExceptionBehavior.StopHost` (el valor por omisión de .NET 6+) **se detenía el
+   host completo**, es decir, el servicio de Windows.
+
+Resultado: el servicio se caía en bucle (reiniciado por `sc failure`), el ETL dejaba de sincronizar,
+y en Sentry no aparecía ni un evento ni un check-in fallido. Exactamente el escenario que el
+monitoreo debía detectar.
+
+**Corrección:**
+
+- `ApagadoEnCurso` (`src/API/Extensions/`): bandera alimentada por
+  `IHostApplicationLifetime.ApplicationStopping` desde `Program.cs`. `SetBeforeSend` ahora descarta
+  cancelaciones **solo mientras el host se está deteniendo**; fuera de eso, una cancelación es un
+  timeout real y se reporta.
+- Los cuatro BackgroundServices usan `catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)`.
+  Una cancelación que no venga del apagado cae ahora en el `catch` general: check-in `error`, evento
+  en Sentry, **y sin `throw;`** — una caída temporal de SICAS ya no tumba el servicio, el ciclo
+  siguiente vuelve a intentar.
+- `ExceptionHandlingMiddleware` distingue por `context.RequestAborted.IsCancellationRequested`, no
+  por el tipo de excepción: un cliente que se desconecta de un lote largo de `/api/Etl/*/Procesar`
+  no alerta, pero un timeout contra SICAS dentro de esa misma petición sí.
+
+**Verificado en ejecución** (ETL apuntado a un host que no responde, `ASPNETCORE_ENVIRONMENT=Production`):
+el ciclo entró al `catch` general (`ETL Seguros (intervalo): error en ejecución programada`), el
+evento se envió con el stack completo hasta `SICASRestClient.EnsureToken:69`, el check-in salió
+como fallo, y el proceso **siguió vivo** (sin `Unhandled exception`, sin `Application is shutting down`).
+
+#### 2. Fallas de arranque no se reportaban
+
+Corriendo como servicio de Windows, un fallo al levantar es la falla más silenciosa que existe: no
+hay petición que devuelva 500 ni ciclo de ETL que falle, solo un servicio que no está y un ETL que
+deja de correr. `Program.cs` ahora envuelve todo el arranque y delega en
+`SentryStartupExtensions.ReportarFallaDeArranque`, que inicializa el SDK de emergencia si la falla
+ocurrió antes de que `UseSentry` alcanzara a hacerlo, vacía la cola a mano (el host nunca llegará a
+hacerlo) y re-lanza para que el Visor de eventos de Windows siga viendo el error original.
+
+#### 3. Cobertura de controladores — `MonitoreoActionFilter`
+
+`src/API/Filters/MonitoreoActionFilter.cs`, registrado como filtro global en `Program.cs`. Etiqueta
+cada petición con `controlador`, `accion` y los identificadores de negocio que vengan en sus
+argumentos, normalizados a los mismos nombres que usan los handlers del ETL (`poliza`, `serie`,
+`folio_siniestro`, `inciso`, `no_siniestro`, `idsiniestro`, `iddocto`). Así un mismo registro se
+rastrea en Sentry sin importar si entró por el barrido automático o por la API.
+
+Se hizo como filtro global y no instrumentando cada acción para que los controllers sigan siendo
+thin y para que cualquier endpoint futuro quede cubierto sin tocar nada. Extrae por **lista blanca**
+de nombres, nunca "todo el modelo": los comandos incluyen datos personales (beneficiario,
+contratante, ejecutivo) que no tienen por qué salir hacia un servicio externo.
+
+#### 4. `Release` fijo en todos los despliegues
+
+Sin `<Version>` en el csproj, `Assembly.GetName().Version` siempre daba `1.0.0` y todos los
+despliegues se veían iguales en Sentry — imposible marcar regresiones o decir "esto empezó con la
+versión de ayer". Se agregó `<Version>1.1.0</Version>` a `LumoSys.Integraciones.API.csproj`.
+**Hay que subirla en cada despliegue** (o fijar `Sentry:Release` por ambiente).
+
+#### 5. Fallo de FTP sin excepción no generaba evento
+
+`FtpStatus.Failed` no lanza: quedaba en `LogWarning` + un rastro que nadie llegaría a ver, pese a
+que para el negocio el resultado es idéntico al de una excepción (el documento no se subió). Elevado
+a `LogError`, que sí produce evento.
+
+#### Verificaciones que salieron limpias
+
+- **Repositorios y clientes SICAS por dominio**: sin `try-catch` — las excepciones propagan hasta los
+  handlers y el middleware, que ya reportan. No hacía falta tocarlos.
+- **Asincronía**: cero `async void`, cero `.Result`/`.Wait()`, cero fire-and-forget en todo `src/`.
+  No hay excepciones asíncronas que se puedan perder.
+- **Privacidad**: `MaxRequestBodySize` queda en `None` (valor por omisión), así que **los cuerpos de
+  las peticiones no se envían a Sentry** — los datos personales de los comandos de póliza no salen
+  del servidor. `SendDefaultPii = true` (igual que lumo-system) hace que sí viajen IP y cabeceras;
+  aceptable en un servicio interno de red local, pero es una decisión consciente, no un descuido.
+
+#### Riesgo conocido que NO se tocó (requiere decisión de negocio)
+
+`bitacora.GuardarAsync(...)` se invoca **dentro** de los `catch` de `ProcesarPolizaCompleta`,
+`ProcesarSiniestroCompleto` y `ProcesarBitacoraDia`, y `BitacoraRepository` no captura nada. Si lo
+caído es justamente `dbLumoSys`, el primer error de póliza intenta dejar constancia, la escritura
+falla, y **esa excepción secundaria sale del `catch` y aborta el barrido completo**, perdiendo todas
+las pólizas que faltaban del lote. Es un comportamiento anterior a la integración de Sentry.
+
+Con las correcciones de arriba el caso ya queda **visible** (el BackgroundService lo reporta como
+corrida fallida), pero la pérdida de registros del lote sigue ocurriendo. El arreglo es envolver esas
+tres llamadas en un método que no propague — pendiente de confirmar, porque cambia cómo se comporta
+el ETL ante una caída de base de datos.
+
+#### Recomendación operativa
+
+Activar **Spike Protection** en el proyecto de Sentry. Con el modo de intervalo a 20 min son ~72
+corridas al día; si una caída prolongada hace fallar cada póliza de cada corrida, el volumen de
+eventos puede consumir la cuota del plan. Sentry agrupa todo en un mismo issue, pero la cuota se
+consume por evento.
+
+### Fallos silenciosos: barrido completo del proyecto (11/09/2026)
+
+Revisión de todos los puntos donde el código devuelve `null`, `0`, `false` o lista vacía ante un
+error de un sistema externo, dejando al llamador sin forma de distinguir el fallo de un resultado
+legítimo. Se auditaron los 88 retornos de ese tipo que hay en `src/`.
+
+#### La raíz: `resp ?? []` en los clientes de dominio
+
+`SICASRestClient.ReadData<T>` devuelve `null` cuando la consulta falla, y todos los métodos de
+`SICASSeguroClient` / `SICASSiniestroClient` lo colapsan con `return resp ?? []` o
+`resp?.FirstOrDefault()`. A partir de ahí **"SICAS respondió 500" y "ese día no hubo pólizas" son el
+mismo valor**: una lista vacía. El barrido la lee como fin de datos, corta el recorrido de páginas,
+escribe *"Lote finalizado"* y cierra su check-in como correcto.
+
+No es teórico: los dos incidentes documentados más arriba en este archivo —el del formato de fecha
+(`dd/MM/yyyy` vs ISO) y el del límite superior exclusivo del filtro— se manifestaron exactamente
+así, y ambos pasaron semanas sin detectarse porque un lote vacío no falla ni escribe nada raro.
+
+**Demostrado en banco de pruebas**: con un SICAS simulado que autentica bien y responde `500` a
+`/Report/ReadData`, `POST /api/Etl/Seguros/Procesar` devuelve
+`HTTP 200 {"estatus":true,"mensaje":"Procesamiento de seguros completado."}`.
+
+#### `IMonitoreoErrores.ReportarFalloSilencioso(...)`
+
+`Capturar` exige una `Exception`, y la mayoría de estos fallos no lanzan nada — ese es justamente el
+problema. Se añadió al puerto de monitoreo:
+
+```csharp
+void ReportarFalloSilencioso(string operacion, string motivo, string consecuencia,
+                             params (string Clave, string? Valor)[] etiquetas);
+```
+
+Emite un `CaptureMessage` de nivel `Error` titulado `[operacion] motivo`, de modo que Sentry agrupa
+en un mismo issue todos los eventos del mismo punto de fallo. Cada evento lleva:
+
+- `operacion` — **dónde** falló (`sicas.readdata`, `sfleet.guardar-poliza`, …).
+- `motivo` — **por qué**, en una línea legible con el código HTTP real.
+- `consecuencia` — **qué se perdió**, que es lo que dice si hay que reprocesar algo a mano.
+- `fallo_silencioso = si` — permite filtrar en Sentry justo esta clase de falla.
+
+#### Puntos instrumentados
+
+| Punto | Qué se silenciaba | Consecuencia reportada |
+|---|---|---|
+| `SICASRestClient.ReadData` (HTTP ≠ 2xx) | **El más grave.** Toda consulta a SICAS pasa por aquí | `consulta-descartada-se-lee-como-sin-registros` |
+| `SICASRestClient.ReadData` (JSON irreparable tras 5 intentos) | Caía al `return null` final, sin una sola línea | idem |
+| `SICASRestClient.BuscarArchivosDigitales` (HTTP ≠ 2xx) | Lista vacía = "no tiene documentos" | `documentos-no-listados-se-lee-como-sin-documentos` |
+| `SICASRestClient.DownloadFile` (HTTP ≠ 2xx) | Solo `LogWarning` | `documento-no-descargado` |
+| `SFleetClient.ObtenerToken` | Sin `access_token` pese a HTTP 200 | `ninguna-poliza-se-sincroniza-con-sfleet` |
+| `SFleetClient.BuscarVehiculo` | `return null` mudo: arriba se leía como "serie no dada de alta", un aviso rutinario | `poliza-no-sincronizada-se-lee-como-serie-inexistente` |
+| `SFleetClient.BuscarPoliza` | `return null` mudo | `se-tratara-como-alta-nueva-riesgo-de-duplicado` |
+| `SFleetClient.GuardarPoliza` | `LogWarning`; el `0` que devuelve no lo revisa nadie | `guardada-en-lumosys-sin-sincronizar-sfleet` |
+| `SFleetClient.SubirDocumento` | **Completamente mudo**: `return resp.IsSuccessStatusCode` sin log ni evento | `documento-no-disponible-en-sfleet` |
+| `PolizaRepository.VincularDocumentoUnidadAsync` (×2) | Silencio absoluto. El PDF queda en el FTP pero sin fila en `DOCUMENTOS_UNIDADES`: invisible desde LumoSys, y la fila de `ARCHIVOS_REPOSITORIOS` queda huérfana | `documento-subido-al-ftp-pero-invisible-en-lumosys` |
+| `ProcesarLoteSeguroHandler` — póliza sin `IDDocto` | `continue` mudo | `poliza-omitida-sin-procesar` |
+| `ProcesarLoteSeguroHandler` — sin detalle / sin primas | `LogWarning`; en el caso de primas ya se confirmó que la serie **sí** es de la flotilla propia | `poliza-no-guardada` |
+| `ProcesarLoteSiniestroHandler` — sin `IDDocto` / sin serie | `LogWarning` | `siniestro-no-guardado` |
+| Documentos de póliza y de siniestro que no se descargan o no suben | `LogWarning` + `continue` | `…-guardado-sin-este-documento` |
+
+`SFleetClient` además quedó envuelto en `try-catch` por método: sus `JObject.Parse` / `JArray.Parse`
+no tenían protección y, si SFleet devuelve HTML de error con un 200, la excepción se reportaba desde
+`SincronizarSFleet` sin decir en qué llamada había ocurrido. El contrato de retorno
+(`null`/`0`/`false`) se conserva intacto.
+
+#### Lo que deliberadamente NO se reporta
+
+Reportar de más es tan inútil como no reportar: un canal con ruido se ignora.
+
+- **"No pertenece a la flotilla propia"** (Seguros y Siniestros) — es el filtro de negocio normal y
+  la mayoría de los registros de SICAS caen ahí. Queda en `LogInformation`.
+- **Sin token, en cada consulta** (`ReadData`, `BuscarArchivosDigitales`) — `EnsureToken` ya reportó
+  la causa raíz; emitir otro evento por consulta multiplicaría un solo fallo en decenas. Queda como
+  rastro, que además se adjunta al evento raíz.
+- **Comentarios de bitácora que no vinculan** (Fase 2) — la bitácora del día trae los comentarios de
+  *todos* los siniestros de SICAS, así que lo normal es que la mayoría no esté en `dbLumoSys`. En su
+  lugar se cuentan y **solo se reporta si, habiendo 20 o más candidatos, ninguno vinculó**: ese es el
+  patrón exacto del bug de Fase 2 del 04/08/2026, cuyo único síntoma era que el historial de estatus
+  dejaba de crecer.
+- **Resolvers de catálogo** (`ResolverEmpresaIdAsync`, `ResolverFormaPagoIdAsync`…) — devuelven `null`
+  por diseño cuando no hay match y el campo queda vacío; es una decisión de negocio ya documentada.
+  `ResolverAseguradoraIdAsync` sí lanza, que es lo correcto porque el dato es obligatorio.
+
+#### Señal agregada: barridos que terminan en cero
+
+`ProcesarLote` (ambos módulos) ahora etiqueta la corrida con `registros_encontrados`. Es lo que
+permite crear en Sentry una alerta sobre el patrón que causó los dos incidentes históricos: un
+barrido diario que termina "correctamente" con cero registros. Para el barrido de intervalo un cero
+es normal; para el diario, en día hábil, no lo es.
+
+#### Verificación
+
+Con el SICAS simulado devolviendo `500` en `/Report/ReadData`, el log de Sentry en modo debug
+muestra la secuencia completa: `ReadData H03117 falló: InternalServerError` → `Capturing event` →
+`Lote Seguros finalizado. 0 pólizas encontradas en el rango.` → `Envelope successfully sent`. El ETL
+se comporta igual que antes —la petición sigue devolviendo `HTTP 200`— pero el fallo ya no es
+invisible.
+
+## Documentos digitales SICAS → Fleet: la cadena estaba rota en tres puntos (13/10/2026)
+
+Reporte de producción: "los archivos digitales de SICAS no están llegando a Fleet". El barrido
+encontró **tres fallas independientes**, ninguna de las cuales producía un error visible.
+
+### 1. Los documentos nunca se enviaban a SFleet — la llamada no existía
+
+`ISFleetClient.SubirDocumento` estaba implementado completo en `SFleetClient` (líneas 228-270) y
+**nadie lo llamaba**. `SincronizarSFleet` recibía el parámetro `archivos` y lo ignoraba por
+completo: no aparecía ni una vez en el cuerpo del método.
+
+No fue una regresión posterior, sino una pérdida en la reescritura: el ETL legacy sí lo hacía
+(`C:\LumoSysGit\Seguros\Generales\Procesar.cs:215`, un `foreach` sobre
+`polizaLumoSys.Vehiculo.Documentos` llamando a `GuardarSeguroDocumento` justo después del alta).
+El método se portó, el `foreach` no. Confirmado con `git log --all -S "sfleetClient.SubirDocumento"`:
+cero resultados en toda la historia del repo. **Desde `bdcbb09` (29/07/2026) ningún documento de
+SICAS llegó jamás a SFleet.**
+
+Corregido: los bytes que ya se descargan para el FTP se conservan en `DocumentoDescargado` y se
+reutilizan; `AdjuntarDocumentosSFleet` los sube después del alta de la póliza (el documento se
+cuelga de ella vía `serviable_id`, así que el orden no es negociable). Cada documento se aísla en
+su propio try-catch y hay saldo de corrida propio (`_sfleetDocsIntentados`/`_sfleetDocsFallidos`).
+
+### 2. Aunque se llamara, no había póliza a la que adjuntar (el 422)
+
+`GuardarPoliza` mandaba 8 campos; el legacy mandaba ~40. SFleet contestaba **422 a todas las
+pólizas**, `GuardarPoliza` devolvía 0 y no existía `serviable_id`. El propio código lo admitía en
+un comentario, y en `docs/sentry-reglas-de-alerta.md` el 422 estaba clasificado como
+"Warning / informativa" — es decir, **la alerta del problema raíz estaba silenciada**.
+
+Corregido: el cuerpo de `request_insurance` reproduce el contrato completo del legacy, incluidos
+`insurer_id` (nuevo `ResolverAseguradoraId`, GET `/insurers`, cacheado por instancia scoped) y
+`catalogue_id = 15`. Los campos que SICAS no provee van en `0`/vacío, igual que en el legacy, para
+no alterar la forma del payload. `rc_aditionals` va en `null` a propósito: SICAS no lo entrega y
+`SDE_AMPARO_RC_ADICIONALES` se guarda nulo, así que rellenarlo con otra cobertura sería inventar.
+
+⚠️ **Esto destraba por primera vez escrituras reales contra SFleet productivo.** Hasta ahora el 422
+las bloqueaba todas. Validar en el primer barrido que las altas se crean bien y que no aparecen
+duplicados.
+
+### 3. Guarda en el PATCH (requisito de la corrección anterior)
+
+`BuscarPoliza` usa la búsqueda difusa `q=` de SFleet y devolvía `.FirstOrDefault()`. Ese id iba a
+la ruta de un `PATCH`: con el payload arreglado, un resultado que no fuera la póliza buscada habría
+**sobrescrito la póliza de otro cliente**. Hasta ahora no ocurrió solo porque el 422 lo impedía.
+
+Corregido: `BuscarPoliza` solo devuelve un id cuando el campo `police` del registro coincide
+exactamente (sin distinguir mayúsculas ni espacios) con el número buscado. Si hay resultados pero
+ninguno exacto, devuelve `null` y reporta — el llamador da de alta, que a lo sumo deja un duplicado
+reversible en vez de destruir datos ajenos.
+
+### 4. Del lado LumoSys/FTP: documentos descartados por un falso positivo
+
+`PolizaRepository.ExisteDocumentoAsync(serie, nombreArchivo)` **ignoraba el parámetro `serie`** y
+además comparaba con `.Contains(...)` en vez de igualdad. Preguntaba si *alguna* unidad del sistema
+tenía un documento `DUN_TDW_ID = 4` cuyo nombre contuviera ese texto. Con los nombres genéricos que
+manda SICAS, el primer documento cargado para cualquier vehículo hacía que los de todos los demás
+se descartaran como "ya existe" y nunca se subieran. Presente desde el commit inicial.
+
+Corregido: se acota al vehículo real (`DUN_CDE_ID` → `COMPRAS_DETALLES.CDE_NO_SERIE`) y se compara
+por igualdad. El equivalente de siniestros (`SiniestroRepository.ExisteDocumentoAsync`) ya filtraba
+bien por `siniestroId`; solo el de seguros estaba roto.
+
+### Secundarios corregidos en el mismo barrido
+
+- **Filas huérfanas en `ARCHIVOS_REPOSITORIOS`**: el `ARC_ID` debe existir antes de subir (el nombre
+  remoto *es* el `ARC_ID`), pero si el FTP fallaba la fila se quedaba apuntando a un archivo
+  inexistente y sin vínculo, invisible para cualquier reproceso. Ahora `SubirDocumentoPolizaHandler`
+  llama a `EliminarArchivoAsync` cuando la subida no se concreta. El folio de la secuencia sí se
+  consume: eso no es reversible y no importa.
+- **`ARC_TMM_ID` fijo en 2 (PDF)**: se mantiene, porque el catálogo `TIPOS_MULTIMEDIA` no está
+  modelado en este proyecto y no hay forma de resolver el id real de otra extensión sin inventarlo.
+  Pero ahora, cuando el archivo no es `.pdf`, se reporta en vez de pasar en silencio. **Pendiente**:
+  modelar el catálogo y mapear la extensión de verdad.
+
+### Pendiente / conocido (no tocado)
+
+- `VincularDocumentoUnidadAsync` resuelve la serie con `FirstOrDefaultAsync(x => x.CDE_NO_SERIE == serie)`
+  sin el filtro de estatus de compra que sí aplica `ResolverOrigenVehiculoAsync` (`COM_TES_ID`).
+  Puede vincular el documento a una compra cancelada si hay varias filas con la misma serie.
+- Nada de esto se pudo probar contra SICAS/SFleet/FTP reales desde el entorno de desarrollo: la
+  verificación fue estática (compila sin advertencias) y por lectura del contrato legacy. **La
+  validación end-to-end está pendiente.**
+
+## Diagnóstico de conectividad: qué host, qué puerto, qué IP (15/10/2026)
+
+Quien opera el integrador no entra al servidor y **no puede dar por hecho que la configuración
+publicada sea la de su copia local**. Hasta ahora, ante un fallo había que adivinar a qué destino
+estaba apuntando realmente el proceso. `IDiagnosticoRed` lo mide desde el propio servidor:
+resuelve el nombre, abre un socket al puerto y nada más — justo lo necesario para separar las tres
+causas que se confundían entre sí:
+
+| Síntoma | Qué significa | A quién se le pide |
+|---|---|---|
+| `DNS: NO RESUELVE` | el servidor no traduce el nombre a IP | soporte / redes |
+| `TCP: BLOQUEADO` | resuelve pero el puerto no acepta | firewall |
+| `TCP: OK` y aun así falla | no es red: credenciales, permisos o la app remota | el dueño del sistema remoto |
+
+**`DiagnosticoConectividadBackgroundService`** corre 20 s después de cada arranque y sondea los
+cuatro destinos. Si todos responden deja solo un rastro; si alguno falla emite
+`diagnostico.conectividad` como **crítico** con la configuración efectiva y un campo
+`que_pedir_a_soporte` redactado para copiarse en un ticket. Ejemplo real del texto que genera:
+
+> El servidor NO resuelve el nombre 'www.sicasonline.info'. PEDIR A SOPORTE: habilitar la
+> resolución DNS de 'www.sicasonline.info' desde este servidor (o agregarlo al archivo hosts).
+
+> El nombre '10.100.102.6' sí resuelve (10.100.102.6) pero el puerto 21 no acepta conexión.
+> PEDIR A SOPORTE: abrir la salida TCP del servidor hacia 10.100.102.6:21.
+
+Los mismos datos (`red_host`, `red_puerto`, `red_dns`, `red_tcp`, `red_resumen`, `red_que_pedir`)
+se adjuntan ahora a los eventos de `sicas.token`, `sicas.descargar-archivo`, `ftp.login`,
+`ftp.subir-archivo` y `sfleet.acceso`. **Nunca se incluyen contraseñas**; el usuario de FTP sí,
+porque es el dato que soporte necesita para revisar permisos.
+
+Nota sobre el FTP: el sondeo mide el **puerto 21 de control**. El de datos lo negocia el modo
+pasivo y es un **rango**, que es el bloqueo más común y el menos obvio — el login funciona y la
+transferencia se queda colgada. Si el login entra pero las subidas fallan, hay que pedir
+explícitamente el rango de puertos pasivos.
+
+### Fleet: autentica pero no autoriza
+
+`sfleet.acceso` es el evento nuevo para el caso medido: `POST /authentications` devuelve 200 con un
+JWT válido y **todos** los endpoints responden 401. Como `BuscarVehiculo` es la primera llamada de
+la sincronización, se corta ahí y ni pólizas ni documentos llegan a Fleet — que es exactamente lo
+que reportan los usuarios al no ver los archivos. Se emite una sola vez por corrida y, cuando la red
+está bien, el texto lo dice sin rodeos: no es red ni contraseña, hay que pedirle al proveedor de
+Fleet que habilite los permisos de API de la cuenta sobre `client_cars`, `request_insurances` e
+`insurers`.
+
+## ⚠️ CAUSA RAÍZ de que los documentos no lleguen: SICAS publica los archivos en OTRO host (15/10/2026)
+
+Tras desplegar la rama `archivos-digitales-sicas`, Sentry reportó desde producción:
+
+```
+SICAS-INTEGRACION-22 · 14/10/2026 15:37 · ETL Siniestros (intervalo)
+System.Net.Http.HttpRequestException: Host desconocido. (www.sicasonline.info:443)
+  en SICASRestClient.DownloadFile
+```
+
+Ahí está todo. **La API y los archivos viven en nombres distintos:**
+
+| Qué | Host | ¿Lo resuelve producción? |
+|---|---|---|
+| API REST (token, ReadData, GetFiles) | `security-services.sicasonline.info` | **Sí** |
+| Archivos (`PathWWW` que devuelve GetFiles) | `www.sicasonline.info` | **No** |
+
+Los tres nombres (`security-services.`, `www.`, y el dominio pelado) resuelven a la **misma IP,
+201.150.37.147** — es el mismo servidor. El de producción solo tiene resuelto uno. Por eso el ETL
+sincroniza pólizas, siniestros, estatus y bitácora sin problema, y **ni un solo documento**: todo lo
+demás viaja por la API; los archivos eran lo único que salía por el otro nombre.
+
+Esto explica también por qué nunca apareció un evento `ftp.login`: la cadena se rompe en la
+descarga, **antes** de llegar al FTP. La pregunta de si el FTP de producción funciona sigue sin
+responderse, y se responderá sola en el primer despliegue con esta corrección.
+
+### La corrección: traer el archivo por la propia API
+
+`GetFiles` con **`URLSecurity=1`** devuelve el archivo completo en **base64 dentro de `PathWWW`**,
+por el host que producción sí resuelve. Verificado contra SICAS real el 15/10/2026 con el siniestro
+35635 (`1-202-2026-R-7234`): los tres PDF decodifican con cabecera `%PDF-` y tamaños idénticos a los
+que muestra el Centro Digital en pantalla.
+
+| Archivo | Centro Digital | Vía API (base64) |
+|---|---|---|
+| `DUA 1-202-2026-M-2373.pdf` | 510.3 KB | 510,260 bytes |
+| `FOTOGRAFIAS 1-202-2026-M-2373.pdf` | 15.1 MB | 15,055,059 bytes |
+| `ODA 1-202-2026-M-2373.pdf` | 202.9 KB | 202,913 bytes |
+
+`ISICASRestClient.ObtenerContenidos` implementa la estrategia: intenta la **descarga directa** y, en
+cuanto una falla **por red** (DNS, conexión, timeout —no un 404, que es otra cosa—), marca
+`_descargaDirectaCaida` y pasa toda la corrida al **respaldo por API**. El cliente es singleton, así
+que la decisión dura lo que el servicio y se reevalúa en cada reinicio: si corrigen el DNS, vuelve
+solo al camino rápido sin tocar código.
+
+Probado reproduciendo el fallo (URL apuntada a un host inexistente): recuperó **3 de 3** archivos en
+42.6 s. El costo del respaldo es real: trae **todos** los archivos de la entidad en una sola
+respuesta, y un siniestro con fotos pesa ~15 MB.
+
+### `URLSecurity`, los tres modos
+
+| Valor | Qué devuelve en `PathWWW` |
+|---|---|
+| `0` | URL directa en `www.sicasonline.info` (lo que se usaba) |
+| `1` | **El archivo completo en base64** |
+| `2` | Un identificador cifrado, no utilizable directamente |
+
+### Bug latente corregido de paso
+
+`ArchivoSICAS.NombreArchivo` deducía el nombre partiendo `PathWWW` por `/`. Con `URLSecurity=1` ese
+campo trae base64, así que el "nombre" habría sido un trozo del contenido. Ahora el nombre sale de
+`FileName` + `Ext`, que SICAS siempre entrega, y el parseo de la URL queda solo como respaldo. El
+resultado es idéntico al anterior para los datos ya migrados, así que no rompe el deduplicado.
+
+### El token sin reintentos tumbaba la pasada completa
+
+```
+SICAS-INTEGRACION-1R · 13/10/2026 13:29 · Sincronización documental (al arrancar)
+[sicas.token] SICAS no entregó token: respondió 500 (InternalServerError)
+consecuencia = ningun-registro-se-sincroniza-desde-sicas
+```
+
+`EnsureToken` se rendía al primer intento. Un solo 500 transitorio dejaba la corrida entera sin
+token. **No es un incidente aislado**: el 15/10/2026 se reprodujo en vivo —cuatro 500 seguidos en
+14 s— y el token salió bien poco después. Ahora reintenta 5 veces con esperas de 3, 8, 20 y 45 s
+(~76 s en total). En un proceso nocturno esa espera no le cuesta nada a nadie; perder la corrida sí.
+
+### Señal nueva en Sentry
+
+Se separó el fallo de **descarga** del de **almacenamiento**, porque el responsable es distinto: uno
+se le pide al administrador de red o a SICAS, el otro al del FTP. Si ninguna descarga de la corrida
+funciona, ahora sale `siniestros.descargar-documentos` como **crítico**, con un `diagnostico` que
+dice exactamente qué pedir: que el servidor resuelva `www.sicasonline.info`, o que SICAS confirme
+`URLSecurity=1` para esta licencia.
+
+## Siniestros: los documentos solo se miraban una vez (13/10/2026)
+
+Reporte de operaciones sobre el siniestro `1-202-2026-R-7234`: "no hay nada cargado, fotos de los
+daños, volante". Verificado contra SICAS y `dbLumoSys` en vivo.
+
+### El hueco
+
+`SubirDocumentos` se invocaba **únicamente** desde `ProcesarSiniestroCompleto`, es decir desde la
+Fase 1, que filtra por `DatSiniestros.FCaptura` — la fecha de **alta** del siniestro. El ajustador
+sube el DUA, las fotografías y la ODA días después, cuando ese folio ya salió de la ventana del
+barrido. La Fase 3 (`ReconciliarAbiertos`) sí vuelve a visitar el siniestro cada día, pero solo
+miraba **estatus y bitácora**: nunca el Centro Digital. Nadie volvía a preguntar por los archivos.
+
+Magnitud medida el 13/10/2026 sobre `dbLumoSys`:
+
+| Año de registro | Siniestros con `SIN_FOLIO_SICAS` | Sin un solo documento |
+|---|---|---|
+| 2026 | 884 | **618** |
+| 2025 | 100 | 0 |
+| 2024 | 141 | 1 |
+| 2023 | 125 | 2 |
+| 2022 | 131 | 1 |
+
+Los años anteriores están sanos porque los migró el ETL legacy. **El hueco nace con este proyecto.**
+
+### Cuánto falta de verdad: barrido contra SICAS (13/10/2026)
+
+Se revisaron contra `/DigitalCenter/GetFiles` los **623** siniestros con `SIN_FOLIO_SICAS` y cero
+documentos en LumoSys. Resultado, sin un solo error de consulta:
+
+| | Siniestros | Archivos en SICAS |
+|---|---|---|
+| **Con documentos pendientes de migrar** | **225** | **467** |
+| Sin documentos en SICAS (nada que traer) | 398 | — |
+
+Y el dato que define el diseño de la corrección:
+
+| Estatus en LumoSys | Siniestros | Archivos |
+|---|---|---|
+| **FECHA DE RESOLUCIÓN (cerrados)** | **159** | 277 |
+| EN TRAMITE | 66 | 190 |
+
+**Dos de cada tres siniestros con documentos pendientes ya están cerrados.** El ajustador sube el
+expediente *después* de que se resuelve el caso. El propio folio que originó el reporte,
+`1-202-2026-R-7234`, está en FECHA DE RESOLUCIÓN con sus 3 archivos esperando en SICAS.
+
+### Corregido — Fase 4, y por qué no bastaba con los abiertos
+
+El primer intento metió la revisión dentro de `ReconciliarAbiertos`, que solo recorre siniestros
+EN TRAMITE/SOLICITUD. El barrido demostró que eso habría recuperado 66 de 225: **el caso reportado
+habría seguido roto**. Se rehízo como fase propia.
+
+`RevisarDocumentosTardios` (Fase 4) corre después de la Fase 3, solo en el barrido diario, sobre la
+unión de dos conjuntos (`ISiniestroRepository.ObtenerParaRevisionDocumentalAsync`):
+
+1. Los que siguen **abiertos**, sin importar su antigüedad.
+2. Los registrados en los últimos **90 días** (`DiasRevisionDocumental`), **aunque estén cerrados**.
+
+No necesita localizar el siniestro en SICAS como hace la Fase 3: `SIN_FOLIO_SICAS` **es** el
+`IDSiniestro` que `GetFiles` espera como `ValuePK`, así que va directo. Tampoco filtra lo ya
+migrado: `SubirDocumentos` consulta `ExisteDocumentoAsync` archivo por archivo, de modo que repasar
+un siniestro completo cuesta una llamada a SICAS y ninguna escritura. Ahora devuelve cuántos guardó.
+
+Cobertura verificada con la consulta equivalente contra la BD real: **701 candidatos** por corrida,
+que cubren **211 de los 225** pendientes, incluido `1-202-2026-R-7234`.
+
+Los **15 que quedan fuera** son todos de junio–julio de 2026 —el arranque del integrador—, cerrados
+y con 1-3 archivos cada uno. Son cola histórica, no un patrón que se repita: se resuelven una sola
+vez con reproceso manual por folio, no ensanchando la ventana diaria a 180 días (que llevaría el
+recorrido de 701 a ~890 siniestros todos los días para siempre).
+
+### Sincronización al desplegar (13/10/2026)
+
+Quien opera este integrador **no administra el FTP ni tiene acceso al servidor**, así que el
+despliegue tiene que ponerse al día solo. `SincronizacionDocumentalBackgroundService` corre dos
+minutos después de cada arranque y lanza la Fase 4 en modo **COMPLETO**: recorre los 1,408
+siniestros vinculados a SICAS, sin ventana de días ni filtro de estatus. El barrido nocturno sigue
+corriéndola en modo **incremental** (780 siniestros hoy).
+
+| Modo | Cuándo | Universo | Hoy | Medido |
+|---|---|---|---|---|
+| Completo | 2 min tras cada arranque **y cada noche** (`EtlSchedule:Documentos`, 01:00) | todos con `SIN_FOLIO_SICAS` | 1,408 | 1.7 s la consulta |
+| Incremental | solo vía endpoint (`completa=false`) | sin documentos ∪ abiertos ∪ últimos 90 días | 780 | 0.5 s |
+
+La pasada nocturna es completa y no incremental porque el modo incremental tiene un **punto ciego
+por diseño**: un siniestro antiguo, cerrado y que YA tiene documentos no entra en ninguno de sus
+tres conjuntos, así que si SICAS le agrega un archivo años después, nadie lo ve. Medido el
+13/10/2026: **91 siniestros, casi todos de 2022-2023, con 140 archivos** que SICAS tiene y LumoSys
+no (finiquitos, denuncias, cartas de liberación subidos mucho después del cierre).
+
+La Fase 4 **ya no se invoca desde el barrido nocturno de siniestros**: la ejecuta solo este
+servicio. Llamarla desde los dos sitios significaba recorrer SICAS dos veces por noche —780
+consultas en incremental más 1,408 en completo— para el mismo resultado.
+
+**Lo que hay pendiente de migrar hoy, en total:**
+
+| Situación en LumoSys | Siniestros | Archivos |
+|---|---|---|
+| Sin ningún documento, teniéndolos SICAS | 225 | 467 |
+| Con documentación parcial | 91 | 140 |
+| **Total** | **316** | **607** |
+
+**Por qué no duplica**: `SubirDocumentos` consulta `ExisteDocumentoAsync` archivo por archivo
+*antes* de descargar, comparando contra `DOCUMENTOS_SINIESTROS.DSI_ARCHIVO` con el patrón
+`{base}_` — que es como se guardan (`{base}_3_{ddMMyyHHmmss}{ext}`). Un siniestro ya completo cuesta
+una llamada a SICAS y **cero** escrituras, así que repetir la pasada en cada reinicio es seguro.
+Límite conocido: dos archivos distintos con el mismo nombre base dentro del mismo siniestro se
+tratan como uno solo; no se ha observado en los datos reales.
+
+También está `POST /api/Etl/Siniestros/Documentos?completa=true|false` para repetirla bajo demanda
+—por ejemplo en cuanto se corrija el acceso al FTP— sin reiniciar el servicio.
+
+### Señales en Sentry para un operador sin acceso al servidor
+
+Lo que esta persona no puede hacer (entrar al servidor, probar el FTP, leer el log en disco) tiene
+que llegarle como evento. Los tres bloqueos posibles emiten **fallo crítico**, que es el nivel sobre
+el que están configuradas las notificaciones:
+
+| Qué se cayó | Evento | Qué dice |
+|---|---|---|
+| dbLumoSys | `siniestros.documentos-tardios` | `la-sincronizacion-de-documentos-no-se-ejecuto` — no se pudo ni listar qué revisar |
+| SICAS | `siniestros.documentos-tardios` | `no-se-sincronizo-ningun-documento-probable-caida-de-sicas` |
+| SICAS (token) | `sicas.token` | `ningun-registro-se-sincroniza-desde-sicas` (ya existía) |
+| FTP | `ftp.login` | código y respuesta literal del servidor + qué pedirle al administrador |
+
+La señal de SICAS merece explicación: `BuscarDigital` devuelve lista vacía tanto ante un siniestro
+sin documentos como ante un fallo HTTP, así que desde dentro del bucle los dos casos son idénticos.
+Solo el agregado los distingue — si **ninguno** de 25+ siniestros revisados devolvió un archivo, no
+es que no hubiera nada: es que no se pudo preguntar.
+
+### El evento de FTP lleva su propio diagnóstico
+
+`FtpDocumentService` ya no reporta "error de FTP" a secas. Distingue `FtpAuthenticationException`
+(rechazo de login → crítico) de `FtpCommandException` (550 y similares) y adjunta `ftp_codigo`,
+`ftp_respuesta`, `ftp_usuario`, `ftp_ruta` y un campo **`diagnostico`** en español que dice la causa
+y **qué pedirle al administrador del FTP**. El objetivo es que ese texto se pueda copiar del evento
+y pegar en la solicitud, sin que nadie tenga que interpretar un código FTP. Los casos cubiertos:
+`530 home directory` (permisos NTFS / aislamiento de usuarios), `530` de contraseña, `530` genérico,
+`550`, `553` y los `4xx` temporales.
+
+### ⚠️ SFleet responde 401 a TODO (13/10/2026)
+
+Comprobado en vivo contra `https://fleetsoluciones.com/api/v1` con las credenciales de
+`appsettings.Local.json`:
+
+- `POST /authentications` → **200**, devuelve `token_type: Bearer` y un JWT cuyas claims son
+  `{"sub":4894,"email":"conexionapi@lumofc.com"}` (sin expiración).
+- `GET /client_cars`, `/client_cars?q=…`, `/request_insurances`, `/insurers` → **401** los cuatro.
+- Probado con `Bearer <token>`, el token sin prefijo, `Token token=<token>` y `X-Auth-Token`: 401
+  en todas las variantes.
+
+O sea: **autentica pero no autoriza**. No es el 422 que documentaba el código — ese diagnóstico está
+desactualizado. Y la consecuencia es más grave de lo que parecía: `BuscarVehiculo` es la PRIMERA
+llamada de `SincronizarSFleet`, así que devuelve null, la función retorna antes de tocar
+`GuardarPoliza` y **ninguna póliza llega nunca a SFleet**. El payload reconstruido no alcanza
+siquiera a enviarse.
+
+Mismo matiz que con el FTP: son las credenciales del entorno de desarrollo y **podrían no ser las
+de producción**. Hay que confirmarlo con un evento real.
+
+**Agujero de observabilidad corregido junto con esto**: ese escenario era completamente mudo.
+`SincronizarSFleet` retornaba antes de incrementar `_sfleetIntentos`/`_sfleetFallos`, así que el
+resumen de la corrida veía 0 y 0 y no emitía nada — el ETL se declaraba exitoso sin haber
+sincronizado una sola póliza. Ahora se cuentan aparte las series buscadas y las no encontradas, y
+si **ninguna** de 5+ aparece, se emite `sfleet.buscar-vehiculo` como **fallo crítico** con la
+consecuencia `ninguna-poliza-llego-a-sfleet-probable-fallo-de-acceso-no-series-inexistentes`.
+
+### Pólizas: medido, y no tiene este problema
+
+Se comprobó si el mismo hueco existía del lado de Seguros: de **2,440** unidades aseguradas desde
+el 29/07/2026, solo **31** no tienen documento de póliza (1.3%). No se construyó una Fase 4
+equivalente para pólizas, y es una decisión medida, no un olvido: además de que el hueco es
+marginal, `SEGUROS` **no tiene columna de vínculo con SICAS** (no hay equivalente a
+`SIN_FOLIO_SICAS`), así que cada póliza necesitaría dos llamadas a SICAS —una para resolver el
+`IDDocto` por número de póliza y otra para listar— en vez de una.
+
+### Cortacircuitos de almacenamiento
+
+La Fase 4 multiplica por ~700 los intentos diarios de guardar documentos. Con el FTP caído eso
+significaría descargar de SICAS cientos de MB cada noche para tirarlos en el último paso —el PDF de
+fotografías de un solo siniestro pesa 14.7 MB—. `AnotarFalloDeAlmacenamiento` corta los intentos
+tras **5 fallos seguidos** de FTP dentro de la misma corrida, emite un evento crítico y detiene el
+recorrido de la Fase 4. El corte va **antes** de la descarga, que es el gasto que se quiere evitar;
+un guardado exitoso reinicia la racha.
+
+### Hipótesis descartada
+
+`ReadRecursive = false` **no** es el problema, aunque el Centro Digital muestre los archivos dentro
+de una subcarpeta `Siniestro_<folio>`. Probado contra SICAS real con `ValuePK` 35635 y 35743: las
+dos variantes devuelven exactamente los mismos elementos.
+
+### Trampa al diagnosticar: el número de la ventana del Centro Digital NO es el IDSiniestro
+
+El título "Centro digital [20260000207208]" es el **NumReporte**, no el `IDSiniestro` que espera
+`GetFiles` como `ValuePK`. En este caso `20260000207208` resultó ser un siniestro **distinto** al
+reportado, de otro vehículo y otro cliente:
+
+| | Folio | SIN_ID | IDSiniestro | Serie | Cliente |
+|---|---|---|---|---|---|
+| Reportado | `1-202-2026-R-7234` | 34723 | 35635 | `JN6BE6CSXK9055450` | 495 |
+| El de la captura | `20260000207208` | 34776 | 35743 | `1FTEW1KP2RKD13525` | 572 |
+
+Antes de actuar sobre una captura de pantalla del Centro Digital, resolver siempre el `IDSiniestro`
+real vía `SINIESTROS.SIN_FOLIO_SICAS`. Subir el expediente equivocado mete documentación de otro
+cliente en un expediente ajeno.
+
 ## Reprocesamiento individual
 
 Si una póliza o siniestro no se procesó correctamente:
@@ -206,6 +965,8 @@ POST /api/Etl/Siniestros/Procesar { "FolioSiniestro": "1-202-2026-R-4295" }
 | FTP con FluentFTP 53 | `System.Net.FtpClient` solo es .NET Framework, incompatible con .NET 9 |
 | JToken `.ToObject<int>()` en SFleetClient | `.Value<int>()` sin key causa ambigüedad en Newtonsoft.Json 13 |
 | `Microsoft.Extensions.Configuration.Binder` en Infrastructure | Necesario para `.Bind()` en clases de biblioteca (no web) |
+| Sentry detras de `IMonitoreoErrores`/`IMonitoreoEtl` en Domain | Application no debe acoplarse a un SDK de terceros (misma regla que EF Core y HTTP); ademas deja el monitoreo desactivable y sustituible |
+| Check-ins de Sentry Crons en el ETL | Un servicio de Windows detenido no lanza excepciones ni escribe logs: la ausencia de check-in es la unica senal que detecta ese caso |
 
 ## Bugs corregidos respecto a proyectos anteriores
 
